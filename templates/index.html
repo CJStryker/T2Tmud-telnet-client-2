@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Console</title>
+</head>
+<body>
+    <div id="console"></div>
+    <form>
+        <input type="text" id="command">
+        <button type="button" onclick="sendCommand()">Send</button>
+    </form>
+    <script>
+        function sendCommand() {
+            // Get the command input
+            var commandInput = document.getElementById("command");
+            var command = commandInput.value;
+
+            // Create a new XMLHttpRequest object
+            var xhr = new XMLHttpRequest();
+
+            // Set up a callback to handle the response
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4 && xhr.status === 200) {
+                    // Get the console output
+                    var consoleOutput = xhr.responseText;
+
+                    // Update the console display
+                    var consoleDiv = document.getElementById("console");
+                    consoleDiv.innerHTML += consoleOutput;
+                }
+            };
+
+            // Send the command to the server
+            xhr.open("POST", "process_command");
+            xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+            xhr.send("command=" + encodeURIComponent(command));
+
+            // Clear the command input
+            commandInput.value = "";
+        }
+    </script>
+</body>
+</html>
