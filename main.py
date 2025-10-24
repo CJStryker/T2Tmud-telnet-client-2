@@ -100,16 +100,19 @@ def print_output(text: str):
     if _partial_line_pending and text.lstrip().startswith(("[event]", "[error]")):
         sys.stdout.write("\n")
         _partial_line_pending = False
-    for chunk in text.splitlines(keepends=True) or [text]:
+    chunks = text.splitlines(keepends=True) or [text]
+    for chunk in chunks:
         if not chunk:
             continue
+        stripped = chunk[:-1] if chunk.endswith("\n") else chunk
+        sys.stdout.write(apply_color(stripped))
         if chunk.endswith("\n"):
-            content = chunk[:-1]
-            sys.stdout.write(apply_color(content))
+            sys.stdout.write("\n")
+            _partial_line_pending = False
+        elif PROMPT_PATTERN.search(stripped):
             sys.stdout.write("\n")
             _partial_line_pending = False
         else:
-            sys.stdout.write(apply_color(chunk))
             _partial_line_pending = True
     if text.endswith("\n"):
         _partial_line_pending = False
@@ -413,6 +416,7 @@ class TelnetClient:
 
     def send(self, command: str):
         if self.connection is None:
+            print_output("[error] Not connected\n")
             return
         to_send = command + "\n"
         with self._send_lock:
@@ -485,6 +489,42 @@ class TelnetClient:
         self._buffer = self._buffer[end:]
 
 
+class UserInputHandler:
+    def __init__(self, client: TelnetClient):
+        self.client = client
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        print_output("[event] Local command input enabled. Type commands and press Enter.\n")
+
+    def stop(self):
+        self._stop_event.set()
+        # Thread is daemonized; no join to avoid blocking on stdin.
+        self._thread = None
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                line = sys.stdin.readline()
+            except KeyboardInterrupt:
+                self._stop_event.set()
+                break
+            except Exception:
+                self._stop_event.set()
+                break
+            if line == "":
+                self._stop_event.set()
+                break
+            command = line.rstrip("\r\n")
+            self.client.send(command)
+
+
 class SessionManager:
     def __init__(self, profiles: Sequence[CharacterProfile]):
         if not profiles:
@@ -502,6 +542,7 @@ class SessionManager:
             read_timeout=OLLAMA_READ_TIMEOUT,
             max_retries=OLLAMA_MAX_RETRIES,
         )
+        self.input_handler = UserInputHandler(self.client)
 
     def current_profile(self) -> CharacterProfile:
         return self.profiles[self.index]
@@ -510,18 +551,22 @@ class SessionManager:
         self.index = (self.index + 1) % len(self.profiles)
 
     def run(self):
-        while True:
-            profile = self.current_profile()
-            try:
-                self.client.connect(profile, self.agent)
-            except RuntimeError as exc:
-                print_output(f"[error] {exc}\n")
-                time.sleep(5)
-                continue
-            self._session_loop()
-            self.client.disconnect()
-            self.rotate_profile()
-            time.sleep(3)
+        self.input_handler.start()
+        try:
+            while True:
+                profile = self.current_profile()
+                try:
+                    self.client.connect(profile, self.agent)
+                except RuntimeError as exc:
+                    print_output(f"[error] {exc}\n")
+                    time.sleep(5)
+                    continue
+                self._session_loop()
+                self.client.disconnect()
+                self.rotate_profile()
+                time.sleep(3)
+        finally:
+            self.input_handler.stop()
 
     def _session_loop(self):
         while True:
