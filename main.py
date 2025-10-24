@@ -185,6 +185,7 @@ def configure_client(client):
         client.add_trigger(prompt, send_username, flags=re.IGNORECASE, once=True)
     for prompt in PASSWORD_PROMPTS:
         client.add_trigger(prompt, send_password, flags=re.IGNORECASE, once=True)
+
     client.add_trigger(LOGIN_SUCCESS_PATTERN, client.start_automation, flags=re.IGNORECASE, once=True)
 
 
