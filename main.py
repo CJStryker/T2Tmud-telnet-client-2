@@ -400,6 +400,33 @@ class GameKnowledge:
         ]
         return "\n".join(sections)
 
+def _extract_json_fragment(text: str) -> Optional[str]:
+    depth = 0
+    start = None
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start : index + 1]
+    return None
 
 ###############################################################################
 # Ollama integration
@@ -434,6 +461,8 @@ def _extract_json_fragment(text: str) -> Optional[str]:
                 return text[start : index + 1]
     return None
 
+class OllamaPlanner:
+    """Collect transcript context and ask Ollama for next commands."""
 
 class OllamaPlanner:
     """Collect transcript context and ask Ollama for next commands."""
@@ -472,6 +501,12 @@ class OllamaPlanner:
         self._environment: Optional[str] = None
         self._travel_state: Optional[str] = None
         self._rest_state: Optional[str] = None
+
+    def shutdown(self):
+        self._stop.set()
+        self._request_event.set()
+        if self._worker.is_alive():
+            self._worker.join(timeout=1.0)
 
     def shutdown(self):
         self._stop.set()
