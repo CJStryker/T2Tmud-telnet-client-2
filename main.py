@@ -107,7 +107,27 @@ BUSY_ATTACK_PATTERN = re.compile(r"You are too busy to make an attack!", re.IGNO
 ITEM_BELONGS_PATTERN = re.compile(r"belongs to the", re.IGNORECASE)
 WIELD_WHAT_PATTERN = re.compile(r"Wield what\?", re.IGNORECASE)
 CONSIDER_PATTERN = re.compile(
-    r"(?P<target>[A-Z][\w' -]+) is (?P<assessment>[^.]+)\.",
+    r"(?m)^\s*(?P<target>[A-Z][\w' -]+?)\s+is\s+(?P<assessment>[^.]+)\.",
+    re.IGNORECASE,
+)
+
+NPC_ABSENT_PATTERN = re.compile(
+    r"(?P<npc>[A-Z][\w' -]+) is nowhere to be found\.",
+    re.IGNORECASE,
+)
+
+SKIN_HINT_PATTERN = re.compile(
+    r"You have killed an animal whose pelt has value",
+    re.IGNORECASE,
+)
+
+ITEM_OK_PATTERN = re.compile(
+    r"(?m)^\s*(?P<item>[^:\n]+?)\s*:\s*Ok\.",
+    re.IGNORECASE,
+)
+
+TRIGGERED_ACTION_PATTERN = re.compile(
+    r"Triggered!\s+doing:\s+(?P<action>[^\n]+)",
     re.IGNORECASE,
 )
 
@@ -711,6 +731,141 @@ class GameKnowledge:
         ]
         return "\n".join(sections)
 
+    PREPARATION_TIPS: Sequence[str] = (
+        "Eat or drink in inns to recover faster before long hunts.",
+        "Carry spare weapons and armor and equip upgrades immediately.",
+        "Check message boards and news for job leads or bounties.",
+        "Bank excess gold to avoid losing coins on death.",
+        "Rent rooms when you have spare gold to unlock private rest areas.",
+        "Stock up on food, drink, and torches before long expeditions.",
+        "Keep rope, lockpicks, and light sources for dungeons and caves.",
+        "Purchase bags or packs to increase carrying capacity before looting sprees.",
+        "Carry healing draughts or bandages if you plan to tackle tougher foes.",
+        "Study help files for each profession to unlock unique abilities.",
+        "Maintain a list of profitable hunting spots and rotate between them.",
+        "Store quest-critical items safely in the bank until needed.",
+    )
+
+    SAFETY_REMINDERS: Sequence[str] = (
+        "Check HP and EP before every combat engagement.",
+        "Abort travelto if HP drops dangerously low during the journey.",
+        "Carry a light source in dark zones to avoid stumbling into hazards.",
+        "Avoid stealing from NPCs to prevent guard retaliation.",
+        "Retreat from creatures that your attacks cannot harm.",
+        "Rest after long hunts so energy regenerates before the next fight.",
+        "Deposit gold frequently to safeguard progress after successful hunts.",
+        "Keep antidotes or cure poison potions for swamp regions.",
+        "Use 'consider <target>' before starting fights with unknown foes.",
+        "Head back to town when stamina or supplies run low.",
+    )
+
+    STRATEGY_GUIDELINES: Sequence[str] = (
+        "Always inspect rooms with 'look' and note available exits.",
+        "Use 'hint' whenever progress seems unclear or a help prompt appears.",
+        "Read message boards, signs, and help topics to gather objectives.",
+        "Interact with NPCs using 'say' and 'ask <npc> about <topic>'.",
+        "Follow signposts with 'travelto <destination>' and let the journey finish before issuing other commands; resume with 'travelto resume' if paused.",
+        "Seek supplies in taverns: 'order <item>', 'rent room', and 'rest' recover resources faster when others are nearby.",
+        "If gold is low, explore nearby streets, wilderness, or hunting grounds, search containers, loot corpses with 'get coins' or 'get all corpse', and sell excess gear before attempting large purchases.",
+        "Before engaging, 'consider <target>' to judge difficulty, focus on low-level creatures or obvious foes, and be ready to 'flee' if health drops.",
+        "After combat, loot coins and valuables, then visit shops or innkeepers to 'list', 'value', 'sell', or 'buy' needed items.",
+        "Follow rumours, message boards, and NPC dialogue for hints about hunting grounds or profitable activities.",
+        "When a shopkeeper or quest giver refuses to help, try other NPCs, different topics such as 'work', 'rumours', 'jobs', or explore outside to find creatures to hunt.",
+        "If movement is blocked, pick another exit or resume 'travelto' journeys from the last signpost.",
+        "Restock resources by resting, eating, or renting rooms when coins allow; gather more money before renting if refused.",
+        "When help topics suggest more reading, queue follow-up 'help <topic>' calls.",
+        "When '--More--' pagination appears, send a blank command to continue.",
+        "Avoid repeating the same command rapidly if the game says you cannot do it.",
+        "Only send in-game commands; never respond with narrative text.",
+        "Record gold income and expenses; if funds drop to zero, hunt or sell items before attempting purchases.",
+        "When NPCs refuse to help, leave the building and explore nearby paths for alternate opportunities.",
+        "Follow time-of-day or weather cues to decide when to rest, travel, or hunt.",
+        "Check 'quests' or 'mission' regularly to track objectives after completing tasks.",
+        "Return to towns to resupply when inventory is empty or equipment is damaged.",
+        "Use 'travelto' to reach fresh hunting grounds when current areas are exhausted.",
+        "Loot corpses promptly to secure coins before they vanish.",
+        "Visit banks to deposit earnings once you have more than a handful of coins.",
+        "If rest is interrupted, find safer rooms or finish combat encounters before trying again.",
+        "Read stable and travel signs to learn additional transportation commands.",
+        "Use 'map' in wilderness areas to orient yourself toward nearby towns or paths.",
+        "Lift, push, or pull suspicious objects when descriptions hint at hidden caches.",
+        "Rotate through multiple exits if searches keep failing to avoid wasting energy.",
+        "Prioritize foes that drop coins or sellable loot before attempting costly purchases.",
+        "When damage is ineffective, retreat, re-equip stronger weapons, or target a weaker enemy.",
+        "Keep track of encumbrance; deposit or sell items before it becomes burdensome.",
+        "If automation stalls in one room, choose a new exit or resume 'travelto' to reach another hub.",
+        "Look for interactive verbs like lift, press, or open in room descriptions and try them explicitly.",
+        "Read forge or workshop signs for crafting opportunities and order materials before experimenting.",
+        "When hints reference specific NPCs, go find them immediately before forgetting their names.",
+        "Rest to recover energy before re-engaging in extended hunts or travelto journeys.",
+        "Record helpful help topics and revisit them if similar issues arise later.",
+        "Check 'legendinfo' and 'charinfo' for long-term goals or progress markers.",
+    )
+
+    @classmethod
+    def build_reference(cls) -> str:
+        def fmt_section(title: str, entries: Iterable[str]) -> str:
+            return f"{title}: " + ", ".join(entries)
+
+        sections = [
+            fmt_section("Core exploration", cls.CORE_COMMANDS),
+            fmt_section("Travel", cls.TRAVEL_COMMANDS),
+            fmt_section("Movement", cls.MOVEMENT_COMMANDS),
+            fmt_section("Interaction", cls.INTERACTION_COMMANDS),
+            fmt_section("Utility", cls.UTILITY_COMMANDS),
+            fmt_section("Economy", cls.ECONOMY_COMMANDS),
+            fmt_section("Town services", cls.TOWN_SERVICES),
+            fmt_section("Support", cls.SUPPORT_COMMANDS),
+            fmt_section("Social", cls.SOCIAL_COMMANDS),
+            fmt_section("Combat", cls.COMBAT_COMMANDS),
+            fmt_section("Hunting", cls.HUNTING_COMMANDS),
+            fmt_section("Wilderness", cls.WILDERNESS_COMMANDS),
+            fmt_section("Crafting", cls.CRAFTING_COMMANDS),
+            fmt_section("Quests", cls.QUEST_COMMANDS),
+            fmt_section("Progress tracking", cls.PROGRESSION_CHECKS),
+            "Preparation: " + ", ".join(cls.PREPARATION_TIPS),
+            "Safety: " + ", ".join(cls.SAFETY_REMINDERS),
+            "Guidelines: " + " ".join(cls.STRATEGY_GUIDELINES),
+        ]
+        return "\n".join(sections)
+
+
+###############################################################################
+# Ollama integration
+###############################################################################
+
+
+def _extract_json_fragment(text: str) -> Optional[str]:
+    depth = 0
+    start = None
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start : index + 1]
+    return None
+
+
+class OllamaPlanner:
+    """Collect transcript context and ask Ollama for next commands."""
 
 ###############################################################################
 # Ollama integration
@@ -1680,6 +1835,19 @@ class TelnetSession:
             self._remove_match(item_match)
             self._handle_prompt()
             return
+        item_ok_match = ITEM_OK_PATTERN.search(self._buffer)
+        if item_ok_match:
+            item_name = item_ok_match.group("item").strip()
+            if item_name:
+                message = f"Collected item: {item_name}"
+                self.display.emit("event", message)
+                if self._planner:
+                    self._planner.note_event(message)
+                    self._planner.record_opportunity(f"Inspect {item_name} for quests or value")
+                    self._planner.request_commands("item collected")
+            self._remove_match(item_ok_match)
+            self._handle_prompt()
+            return
         search_success_match = SEARCH_SUCCESS_PATTERN.search(self._buffer)
         if search_success_match:
             discovery = search_success_match.group("discovery").strip()
@@ -1732,6 +1900,21 @@ class TelnetSession:
                 self._planner.note_event(f"Hint observed: {hint_text}")
                 self._planner.request_commands("hint observed")
             self._remove_match(hint_match)
+            self._handle_prompt()
+            return
+        skin_hint_match = SKIN_HINT_PATTERN.search(self._buffer)
+        if skin_hint_match:
+            self.display.emit(
+                "event",
+                "Skin the corpse with a knife to collect pelts for gold",
+            )
+            if self._planner:
+                self._planner.note_event("Corpse can be skinned for profit")
+                self._planner.record_opportunity("Skin corpse for pelt")
+                self._planner.request_commands("skin corpse")
+            self._remove_match(skin_hint_match)
+            self._handle_prompt()
+            return
         updates_match = UPDATES_ALERT_PATTERN.search(self._buffer)
         if updates_match:
             self.display.emit("event", "Updates available; run 'updates all' for the latest changes")
@@ -1917,6 +2100,17 @@ class TelnetSession:
             self._remove_match(match)
             self._handle_prompt()
             return
+        triggered_match = TRIGGERED_ACTION_PATTERN.search(self._buffer)
+        if triggered_match:
+            action = triggered_match.group("action").strip()
+            self.display.emit(
+                "event",
+                f"Local trigger activated command '{action}'; be mindful of scripted actions",
+            )
+            if self._planner:
+                self._planner.note_event(f"Trigger executed: {action}")
+                self._planner.record_issue(f"Trigger fired '{action}'")
+            self._remove_match(triggered_match)
         match = MULTI_TARGET_PATTERN.search(self._buffer)
         if match:
             self.display.emit("event", "Multiple targets found; specify which NPC or item to interact with")
@@ -1968,6 +2162,20 @@ class TelnetSession:
             self._remove_match(blank_match)
             self._handle_prompt()
             return
+        npc_absent_match = NPC_ABSENT_PATTERN.search(self._buffer)
+        if npc_absent_match:
+            npc_name = npc_absent_match.group("npc").strip()
+            self.display.emit(
+                "event",
+                f"{npc_name} is not nearby; search the area or revisit later",
+            )
+            if self._planner:
+                self._planner.note_event(f"{npc_name} absent from location")
+                self._planner.record_issue(f"{npc_name} not present")
+                self._planner.request_commands("npc missing")
+            self._remove_match(npc_absent_match)
+            self._handle_prompt()
+            return
         match = REST_START_PATTERN.search(self._buffer)
         if match:
             self.display.emit("event", "Resting to recover; monitor HP/EP before resuming hunts")
@@ -2015,10 +2223,14 @@ class TelnetSession:
         if consider_match:
             target = consider_match.group("target").strip()
             assessment = consider_match.group("assessment").strip()
-            target_head = target.lower().split()[0]
+            last_command = (self._last_command_sent or "").lower()
+            target_head = re.sub(r"[^a-zA-Z']+", "", target.split()[0].lower()) if target.split() else ""
             assessment_lower = assessment.lower()
-            if target_head in CONSIDER_TARGET_STOPWORDS or not any(
-                keyword in assessment_lower for keyword in CONSIDER_ASSESSMENT_KEYWORDS
+            if (
+                not last_command.startswith("consider")
+                or not assessment
+                or target_head in CONSIDER_TARGET_STOPWORDS
+                or not any(keyword in assessment_lower for keyword in CONSIDER_ASSESSMENT_KEYWORDS)
             ):
                 self._remove_match(consider_match)
             else:
