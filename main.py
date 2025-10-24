@@ -62,12 +62,20 @@ TARGET_LINE_PATTERN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 GOLD_STATUS_PATTERN = re.compile(r"Gold:\s*(?P<amount>\d+)", re.IGNORECASE)
+INVENTORY_HEADER_PATTERN = re.compile(
+    r"Gold:\s*(?P<gold>\d+)\s+Encumbrance:\s*(?P<encumbrance>[A-Za-z ]+)",
+    re.IGNORECASE,
+)
+INVENTORY_EMPTY_PATTERN = re.compile(r"You are not carrying any items right now\.", re.IGNORECASE)
+INVENTORY_LIST_PATTERN = re.compile(r"You are carrying the following on your person:", re.IGNORECASE)
 MENU_HINT_PATTERN = re.compile(r"Try reading the menu\.", re.IGNORECASE)
 BOARD_HELP_PATTERN = re.compile(r"Type 'help board'", re.IGNORECASE)
 BLANK_RESPONSE_PATTERN = re.compile(r"looks at you blankly\.", re.IGNORECASE)
 NO_STOCK_PATTERN = re.compile(r"does not have any of that\.", re.IGNORECASE)
 NO_QUESTS_PATTERN = re.compile(r"No quests done yet\.", re.IGNORECASE)
 NEWS_ALERT_PATTERN = re.compile(r"News in Arda!", re.IGNORECASE)
+UPDATES_ALERT_PATTERN = re.compile(r"There are many new updates", re.IGNORECASE)
+EMAIL_REMINDER_PATTERN = re.compile(r"You have not yet set your email address\.", re.IGNORECASE)
 LOCATION_AT_PATTERN = re.compile(r"You are currently at (?P<location>[^.]+)\.", re.IGNORECASE)
 ROOM_NAME_PATTERNS: Sequence[re.Pattern[str]] = (
     re.compile(r"This is the (?P<room>[^.]+)\.", re.IGNORECASE),
@@ -83,6 +91,22 @@ STANDARD_EXITS_PATTERN = re.compile(
 )
 SKY_PATTERN = re.compile(r"The sky is (?P<sky>[^.]+)\.", re.IGNORECASE)
 TIME_OF_DAY_PATTERN = re.compile(r"The sun (?:shines|has set|is) (?P<detail>[^.]+)\.", re.IGNORECASE)
+PATH_CONTINUES_PATTERN = re.compile(r"The path continues (?P<directions>[^.]+)\.", re.IGNORECASE)
+CITY_NEAR_PATTERN = re.compile(r"The City of (?P<city>[^.]+) is (?P<direction>[^.]+)\.", re.IGNORECASE)
+FORGE_PATH_PATTERN = re.compile(r"It appears to lead to a forge", re.IGNORECASE)
+CLOSED_DOOR_PATTERN = re.compile(r"The (?P<direction>[a-z]+) door is closed\.", re.IGNORECASE)
+CORPSE_MISSING_PATTERN = re.compile(r"There is not a single corpse here to get\.", re.IGNORECASE)
+NO_EFFECT_PATTERN = re.compile(r"You hit [^\n]+ but to no effect\.", re.IGNORECASE)
+LOW_DAMAGE_PATTERN = re.compile(r"You scratch [^\n]+\.", re.IGNORECASE)
+BUSY_ATTACK_PATTERN = re.compile(r"You are too busy to make an attack!", re.IGNORECASE)
+ITEM_BELONGS_PATTERN = re.compile(r"belongs to the", re.IGNORECASE)
+WIELD_WHAT_PATTERN = re.compile(r"Wield what\?", re.IGNORECASE)
+CONSIDER_PATTERN = re.compile(
+    r"(?P<target>[A-Z][\w' -]+) is (?P<assessment>[^.]+)\.",
+    re.IGNORECASE,
+)
+SUGGEST_ACTION_PATTERN = re.compile(r"Perhaps it could be (?P<action>[a-z]+)", re.IGNORECASE)
+MAP_SUGGESTION_PATTERN = re.compile(r"use the 'map' command", re.IGNORECASE)
 HINT_SUGGESTION_PATTERN = re.compile(r"\*\*\* HINT \*\*\*\s*:\s*(?P<hint>.+)")
 TARGET_MEMORY_SECONDS = 45.0
 
@@ -190,6 +214,10 @@ class GameKnowledge:
         "help rules",
         "help list",
         "help newbie",
+        "help economy",
+        "help hunting",
+        "help guilds",
+        "help banking",
         "updates all",
         "news",
         "read news",
@@ -198,11 +226,17 @@ class GameKnowledge:
         "map",
         "exits",
         "consider <target>",
+        "journal",
+        "notes",
         "travelto <destination>",
         "travelto resume",
         "search",
         "rest",
         "missions",
+        "practice",
+        "train",
+        "save",
+        "quit",
     )
 
     MOVEMENT_COMMANDS: Sequence[str] = (
@@ -218,11 +252,18 @@ class GameKnowledge:
         "down",
         "enter",
         "leave",
+        "out",
         "go <direction>",
         "open <direction> door",
         "climb <object>",
+        "lift <object>",
+        "push <object>",
+        "pull <object>",
         "travelto <destination>",
         "travelto resume",
+        "follow <path>",
+        "sneak <direction>",
+        "run <direction>",
     )
 
     INTERACTION_COMMANDS: Sequence[str] = (
@@ -240,21 +281,36 @@ class GameKnowledge:
         "drop <item>",
         "wear <item>",
         "wield <item>",
+        "equip <item>",
+        "remove <item>",
         "give <item> to <npc>",
         "give <amount> gold to <npc>",
         "ask <npc> about work",
         "ask <npc> about rumours",
         "ask <npc> about travel",
         "ask <npc> about jobs",
+        "ask <npc> about quest",
+        "ask <npc> about gold",
+        "ask <npc> about rumours",
         "buy <item>",
         "sell <item>",
         "order <item>",
         "list",
         "value <item>",
+        "appraise <item>",
+        "lift shelf",
+        "open door",
+        "unlock <object>",
+        "search <container>",
+        "listen",
         "hint",
         "help <topic>",
         "travelto resume",
         "read news",
+        "updates all",
+        "study <object>",
+        "smell",
+        "taste",
     )
 
     ECONOMY_COMMANDS: Sequence[str] = (
@@ -279,6 +335,12 @@ class GameKnowledge:
         "sell loot",
         "sell all corpse",
         "appraise <item>",
+        "auction <item>",
+        "collect bounty",
+        "donate <amount>",
+        "exchange <item>",
+        "buy room",
+        "tip <npc>",
     )
 
     COMBAT_COMMANDS: Sequence[str] = (
@@ -297,6 +359,12 @@ class GameKnowledge:
         "butcher <corpse>",
         "bash <target>",
         "kick <target>",
+        "parry",
+        "disarm <target>",
+        "retreat",
+        "target <enemy>",
+        "assist <ally>",
+        "charge <target>",
     )
 
     QUEST_COMMANDS: Sequence[str] = (
@@ -324,6 +392,13 @@ class GameKnowledge:
         "butcher <corpse>",
         "sell <loot>",
         "flee",
+        "follow tracks",
+        "ambush <target>",
+        "hide",
+        "sneak",
+        "set trap",
+        "stalk <target>",
+        "aim",
     )
 
     SUPPORT_COMMANDS: Sequence[str] = (
@@ -339,6 +414,15 @@ class GameKnowledge:
         "travelto resume",
         "save",
         "quit",
+        "comm off",
+        "camp",
+        "light torch",
+        "fill waterskin",
+        "drink <item>",
+        "eat <item>",
+        "prepare <item>",
+        "memorize",
+        "practice",
     )
 
     PREPARATION_TIPS: Sequence[str] = (
@@ -348,6 +432,12 @@ class GameKnowledge:
         "Bank excess gold to avoid losing coins on death.",
         "Rent rooms when you have spare gold to unlock private rest areas.",
         "Stock up on food, drink, and torches before long expeditions.",
+        "Keep rope, lockpicks, and light sources for dungeons and caves.",
+        "Purchase bags or packs to increase carrying capacity before looting sprees.",
+        "Carry healing draughts or bandages if you plan to tackle tougher foes.",
+        "Study help files for each profession to unlock unique abilities.",
+        "Maintain a list of profitable hunting spots and rotate between them.",
+        "Store quest-critical items safely in the bank until needed.",
     )
 
     STRATEGY_GUIDELINES: Sequence[str] = (
@@ -379,6 +469,19 @@ class GameKnowledge:
         "Visit banks to deposit earnings once you have more than a handful of coins.",
         "If rest is interrupted, find safer rooms or finish combat encounters before trying again.",
         "Read stable and travel signs to learn additional transportation commands.",
+        "Use 'map' in wilderness areas to orient yourself toward nearby towns or paths.",
+        "Lift, push, or pull suspicious objects when descriptions hint at hidden caches.",
+        "Rotate through multiple exits if searches keep failing to avoid wasting energy.",
+        "Prioritize foes that drop coins or sellable loot before attempting costly purchases.",
+        "When damage is ineffective, retreat, re-equip stronger weapons, or target a weaker enemy.",
+        "Keep track of encumbrance; deposit or sell items before it becomes burdensome.",
+        "If automation stalls in one room, choose a new exit or resume 'travelto' to reach another hub.",
+        "Look for interactive verbs like lift, press, or open in room descriptions and try them explicitly.",
+        "Read forge or workshop signs for crafting opportunities and order materials before experimenting.",
+        "When hints reference specific NPCs, go find them immediately before forgetting their names.",
+        "Rest to recover energy before re-engaging in extended hunts or travelto journeys.",
+        "Record helpful help topics and revisit them if similar issues arise later.",
+        "Check 'legendinfo' and 'charinfo' for long-term goals or progress markers.",
     )
 
     @classmethod
@@ -400,33 +503,6 @@ class GameKnowledge:
         ]
         return "\n".join(sections)
 
-def _extract_json_fragment(text: str) -> Optional[str]:
-    depth = 0
-    start = None
-    in_string = False
-    escape = False
-    for index, char in enumerate(text):
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            if depth == 0:
-                start = index
-            depth += 1
-        elif char == "}":
-            if depth == 0:
-                continue
-            depth -= 1
-            if depth == 0 and start is not None:
-                return text[start : index + 1]
-    return None
 
 ###############################################################################
 # Ollama integration
@@ -461,8 +537,6 @@ def _extract_json_fragment(text: str) -> Optional[str]:
                 return text[start : index + 1]
     return None
 
-class OllamaPlanner:
-    """Collect transcript context and ask Ollama for next commands."""
 
 class OllamaPlanner:
     """Collect transcript context and ask Ollama for next commands."""
@@ -501,12 +575,11 @@ class OllamaPlanner:
         self._environment: Optional[str] = None
         self._travel_state: Optional[str] = None
         self._rest_state: Optional[str] = None
-
-    def shutdown(self):
-        self._stop.set()
-        self._request_event.set()
-        if self._worker.is_alive():
-            self._worker.join(timeout=1.0)
+        self._encumbrance: Optional[str] = None
+        self._inventory_state: Optional[str] = None
+        self._location_history: Deque[str] = deque(maxlen=16)
+        self._location_streak: int = 0
+        self._stagnation_flag: Optional[str] = None
 
     def shutdown(self):
         self._stop.set()
@@ -541,6 +614,11 @@ class OllamaPlanner:
             self._environment = None
             self._travel_state = None
             self._rest_state = None
+            self._encumbrance = None
+            self._inventory_state = None
+            self._location_history.clear()
+            self._location_streak = 0
+            self._stagnation_flag = None
         self._request_event.clear()
 
     def observe_output(self, text: str):
@@ -585,9 +663,15 @@ class OllamaPlanner:
             return
         with self._lock:
             if self._location == cleaned:
-                return
-            self._location = cleaned
-            self._append_transcript(f"[location] {cleaned}\n")
+                self._location_streak += 1
+                if self._location_streak <= 3:
+                    self._append_transcript(f"[location-repeat] {cleaned} x{self._location_streak}\n")
+            else:
+                self._location = cleaned
+                self._location_streak = 1
+                self._stagnation_flag = None
+                self._append_transcript(f"[location] {cleaned}\n")
+            self._location_history.append(cleaned)
 
     def update_exits(self, exits: str):
         if not self.enabled:
@@ -636,6 +720,47 @@ class OllamaPlanner:
                 return
             self._rest_state = cleaned
             self._append_transcript(f"[rest] {cleaned}\n")
+
+    def update_encumbrance(self, state: str):
+        if not self.enabled:
+            return
+        cleaned = state.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            normalized = cleaned.lower()
+            if self._encumbrance == normalized:
+                return
+            self._encumbrance = normalized
+            self._append_transcript(f"[encumbrance] {normalized}\n")
+
+    def update_inventory_state(self, state: str):
+        if not self.enabled:
+            return
+        cleaned = state.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            normalized = cleaned.lower()
+            if self._inventory_state == normalized:
+                return
+            self._inventory_state = normalized
+            self._append_transcript(f"[inventory] {normalized}\n")
+
+    def track_stagnation(self, location: str, streak: int):
+        if not self.enabled:
+            return
+        if streak < 1:
+            return
+        cleaned = location.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            if streak >= 4 and self._stagnation_flag != cleaned:
+                self._stagnation_flag = cleaned
+                self._issues.append(f"Still at {cleaned} after {streak} prompts; explore new actions")
+            elif streak <= 1 and self._stagnation_flag == cleaned:
+                self._stagnation_flag = None
 
     def record_issue(self, issue: str):
         if not self.enabled:
@@ -723,6 +848,9 @@ class OllamaPlanner:
             environment = self._environment
             travel_state = self._travel_state
             rest_state = self._rest_state
+            encumbrance = self._encumbrance
+            inventory_state = self._inventory_state
+            location_history = list(self._location_history)
         summary_lines = []
         if recent_commands:
             summary_lines.append("Recent commands: " + ", ".join(recent_commands))
@@ -730,6 +858,13 @@ class OllamaPlanner:
             summary_lines.append("Player-entered commands: " + ", ".join(manual))
         if events:
             summary_lines.append("Notable events: " + "; ".join(events))
+        if location_history:
+            ordered: List[str] = []
+            for entry in location_history:
+                if entry not in ordered:
+                    ordered.append(entry)
+            if ordered:
+                summary_lines.append("Recent locations: " + " -> ".join(ordered[-5:]))
         status_bits: List[str] = []
         if hp is not None and ep is not None:
             status_bits.append(f"HP {hp} / EP {ep}")
@@ -745,6 +880,10 @@ class OllamaPlanner:
             status_bits.append(f"Travel: {travel_state}")
         if rest_state:
             status_bits.append(f"Rest: {rest_state}")
+        if encumbrance:
+            status_bits.append(f"Encumbrance: {encumbrance}")
+        if inventory_state:
+            status_bits.append(f"Inventory: {inventory_state}")
         if status_bits:
             summary_lines.append("Status: " + "; ".join(status_bits))
         if issues:
@@ -925,6 +1064,8 @@ class TelnetSession:
         self._last_location_summary: Optional[str] = None
         self._last_exits_summary: Optional[str] = None
         self._last_environment_summary: Optional[str] = None
+        self._repeat_location_count = 0
+        self._stagnation_notice_location: Optional[str] = None
 
     def attach_planner(self, planner: OllamaPlanner):
         self._planner = planner
@@ -945,6 +1086,8 @@ class TelnetSession:
         self._last_location_summary = None
         self._last_exits_summary = None
         self._last_environment_summary = None
+        self._repeat_location_count = 0
+        self._stagnation_notice_location = None
         try:
             self.connection = telnetlib.Telnet(HOST, PORT)
         except OSError as exc:
@@ -1101,14 +1244,35 @@ class TelnetSession:
                     location_name = name_match.group("room").strip()
                     self._remove_match(name_match)
                     break
-        if location_name and location_name != self._last_location_summary:
-            self._last_location_summary = location_name
-            self._search_failures = 0
-            self._blank_response_streak = 0
-            self.display.emit("event", f"Location update: {location_name}")
+        if location_name:
+            if location_name == self._last_location_summary:
+                self._repeat_location_count += 1
+            else:
+                self._last_location_summary = location_name
+                self._search_failures = 0
+                self._blank_response_streak = 0
+                self._repeat_location_count = 1
+                self._stagnation_notice_location = None
+                self.display.emit("event", f"Location update: {location_name}")
+                if self._planner:
+                    self._planner.note_event(f"Now at {location_name}")
             if self._planner:
                 self._planner.update_location(location_name)
-                self._planner.note_event(f"Now at {location_name}")
+                self._planner.track_stagnation(location_name, self._repeat_location_count)
+            if (
+                self._repeat_location_count >= 4
+                and self._stagnation_notice_location != location_name
+            ):
+                self._stagnation_notice_location = location_name
+                self.display.emit(
+                    "event",
+                    f"Still in {location_name}; explore new exits or objectives",
+                )
+                if self._planner:
+                    self._planner.record_issue(
+                        f"Still in {location_name} after several prompts"
+                    )
+                    self._planner.request_commands("stuck in location")
         exits_summary: Optional[str] = None
         exits_match = EXITS_PATTERN.search(self._buffer)
         if exits_match:
@@ -1150,6 +1314,55 @@ class TelnetSession:
                 self.display.emit("event", f"Environment update: {environment_summary}")
                 if self._planner:
                     self._planner.update_environment(environment_summary)
+        path_match = PATH_CONTINUES_PATTERN.search(self._buffer)
+        if path_match:
+            directions = path_match.group("directions").strip()
+            self.display.emit(
+                "event",
+                f"Path continues {directions}; explore to track new routes",
+            )
+            if self._planner:
+                self._planner.note_event(f"Path continues {directions}")
+            self._remove_match(path_match)
+        city_match = CITY_NEAR_PATTERN.search(self._buffer)
+        if city_match:
+            city = city_match.group("city").strip()
+            direction = city_match.group("direction").strip()
+            self.display.emit(
+                "event",
+                f"Nearby city {city} lies {direction}; consider visiting for supplies",
+            )
+            if self._planner:
+                self._planner.note_event(f"City {city} located {direction}")
+            self._remove_match(city_match)
+        forge_match = FORGE_PATH_PATTERN.search(self._buffer)
+        if forge_match:
+            self.display.emit(
+                "event",
+                "Forge entrance spotted; try 'path' or 'enter' to investigate",
+            )
+            if self._planner:
+                self._planner.record_issue("Forge entrance available for crafting or trade")
+                self._planner.request_commands("forge entrance")
+            self._remove_match(forge_match)
+        action_hint_match = SUGGEST_ACTION_PATTERN.search(self._buffer)
+        if action_hint_match:
+            action = action_hint_match.group("action").strip()
+            self.display.emit(
+                "event",
+                f"Room suggests you '{action}' something; experiment with that verb",
+            )
+            if self._planner:
+                self._planner.record_issue(f"Try to {action} the highlighted object")
+                self._planner.request_commands(f"try to {action}")
+            self._remove_match(action_hint_match)
+        map_hint_match = MAP_SUGGESTION_PATTERN.search(self._buffer)
+        if map_hint_match:
+            self.display.emit("event", "Map hint detected; use 'map' to orient yourself")
+            if self._planner:
+                self._planner.note_event("Game suggested using map command")
+                self._planner.request_commands("map hint")
+            self._remove_match(map_hint_match)
         hint_match = HINT_SUGGESTION_PATTERN.search(self._buffer)
         if hint_match:
             hint_text = hint_match.group("hint").strip()
@@ -1158,6 +1371,48 @@ class TelnetSession:
                 self._planner.note_event(f"Hint observed: {hint_text}")
             self._remove_match(hint_match)
             return
+        updates_match = UPDATES_ALERT_PATTERN.search(self._buffer)
+        if updates_match:
+            self.display.emit("event", "Updates available; run 'updates all' for the latest changes")
+            if self._planner:
+                self._planner.note_event("Game announced new updates")
+                self._planner.record_issue("Review 'updates all' for new content")
+            self._remove_match(updates_match)
+            return
+        email_match = EMAIL_REMINDER_PATTERN.search(self._buffer)
+        if email_match:
+            self.display.emit("event", "Email not set; use 'chfn' if needed (optional)")
+            self._remove_match(email_match)
+        header_match = INVENTORY_HEADER_PATTERN.search(self._buffer)
+        if header_match:
+            amount = int(header_match.group("gold"))
+            enc_state = header_match.group("encumbrance").strip()
+            message = (
+                "Gold purse is empty; gather coins before shopping"
+                if amount == 0
+                else f"Gold on hand: {amount}"
+            )
+            if self._last_gold_report != amount:
+                self.display.emit("event", message)
+                self._last_gold_report = amount
+            if self._planner:
+                self._planner.update_gold(amount)
+                self._planner.update_encumbrance(enc_state)
+                self._planner.update_inventory_state(f"encumbrance {enc_state}")
+                self._planner.note_event(message)
+            self._remove_match(header_match)
+        empty_match = INVENTORY_EMPTY_PATTERN.search(self._buffer)
+        if empty_match:
+            self.display.emit("event", "Inventory empty; hunt or loot items to sell")
+            if self._planner:
+                self._planner.update_inventory_state("empty")
+                self._planner.record_issue("Inventory empty; gather loot")
+            self._remove_match(empty_match)
+        carrying_match = INVENTORY_LIST_PATTERN.search(self._buffer)
+        if carrying_match:
+            if self._planner:
+                self._planner.update_inventory_state("items carried")
+            self._remove_match(carrying_match)
         match = NO_GOLD_PATTERN.search(self._buffer)
         if match:
             self._gold_failures += 1
@@ -1228,6 +1483,18 @@ class TelnetSession:
                 self._planner.request_commands("movement blocked")
             self._remove_match(match)
             return
+        door_match = CLOSED_DOOR_PATTERN.search(self._buffer)
+        if door_match:
+            direction = door_match.group("direction").lower()
+            self.display.emit(
+                "event",
+                f"The {direction} door is closed; try 'open {direction} door' before moving",
+            )
+            if self._planner:
+                self._planner.record_issue(f"{direction} door closed")
+                self._planner.request_commands("door closed")
+            self._remove_match(door_match)
+            return
         match = TARGET_MISSING_PATTERN.search(self._buffer)
         if match:
             self.display.emit("event", "Target not present; try examining the room or another NPC")
@@ -1244,6 +1511,14 @@ class TelnetSession:
                 self._planner.request_commands("item missing")
             self._remove_match(match)
             return
+        corpse_match = CORPSE_MISSING_PATTERN.search(self._buffer)
+        if corpse_match:
+            self.display.emit("event", "No corpse available yet; finish combat before looting")
+            if self._planner:
+                self._planner.record_issue("Attempted to loot before corpse existed")
+                self._planner.request_commands("corpse missing")
+            self._remove_match(corpse_match)
+            return
         stock_match = NO_STOCK_PATTERN.search(self._buffer)
         if stock_match:
             self.display.emit("event", "Shop lacks that item; check 'list' or try another vendor")
@@ -1252,6 +1527,14 @@ class TelnetSession:
                 self._planner.record_issue("Requested item not sold here")
                 self._planner.request_commands("item unavailable")
             self._remove_match(stock_match)
+            return
+        belongs_match = ITEM_BELONGS_PATTERN.search(self._buffer)
+        if belongs_match:
+            self.display.emit("event", "Item belongs to someone; avoid theft and seek legal loot")
+            if self._planner:
+                self._planner.record_issue("Item was owned; look for alternatives")
+                self._planner.request_commands("item owned")
+            self._remove_match(belongs_match)
             return
         match = STEALING_PATTERN.search(self._buffer)
         if match:
@@ -1268,6 +1551,14 @@ class TelnetSession:
                 self._planner.note_event("Need to disambiguate multi-target selection")
                 self._planner.request_commands("multiple targets")
             self._remove_match(match)
+            return
+        wield_match = WIELD_WHAT_PATTERN.search(self._buffer)
+        if wield_match:
+            self.display.emit("event", "Specify an item to wield; check inventory for weapons")
+            if self._planner:
+                self._planner.record_issue("Wield command missing target item")
+                self._planner.request_commands("wield guidance")
+            self._remove_match(wield_match)
             return
         news_match = NEWS_ALERT_PATTERN.search(self._buffer)
         if news_match:
@@ -1318,6 +1609,38 @@ class TelnetSession:
                 self._planner.request_commands("rest interrupted")
             self._remove_match(match)
             return
+        busy_match = BUSY_ATTACK_PATTERN.search(self._buffer)
+        if busy_match:
+            self.display.emit("event", "Busy fighting; wait for round to finish or issue defensive commands")
+            if self._planner:
+                self._planner.record_issue("Too busy to attack; avoid spamming commands")
+            self._remove_match(busy_match)
+            return
+        no_effect_match = NO_EFFECT_PATTERN.search(self._buffer)
+        if no_effect_match:
+            self.display.emit("event", "Attacks have no effect; switch weapons or retreat")
+            if self._planner:
+                self._planner.record_issue("Attacks ineffective against foe")
+                self._planner.request_commands("attack ineffective")
+            self._remove_match(no_effect_match)
+            return
+        low_damage_match = LOW_DAMAGE_PATTERN.search(self._buffer)
+        if low_damage_match:
+            self.display.emit("event", "Damage is minimal; consider stronger weapons or new tactics")
+            if self._planner:
+                self._planner.record_issue("Dealing minimal damage")
+            self._remove_match(low_damage_match)
+        consider_match = CONSIDER_PATTERN.search(self._buffer)
+        if consider_match:
+            target = consider_match.group("target").strip()
+            assessment = consider_match.group("assessment").strip()
+            self.display.emit(
+                "event",
+                f"Assessment: {target} is {assessment}; choose fights accordingly",
+            )
+            if self._planner:
+                self._planner.note_event(f"Considered {target}: {assessment}")
+            self._remove_match(consider_match)
         enemy_match = TARGET_LINE_PATTERN.search(self._buffer)
         if enemy_match:
             raw_name = enemy_match.group("name").strip()
@@ -1446,6 +1769,32 @@ class ConsoleInputThread(threading.Thread):
 # Application bootstrap
 ###############################################################################
 
+###############################################################################
+# Application bootstrap
+###############################################################################
+
+
+def run_client():
+    display = TerminalDisplay()
+    if not DEFAULT_PROFILES:
+        display.emit("error", "No character profiles configured.")
+        display.ensure_newline()
+        return
+
+    knowledge_text = GameKnowledge.build_reference()
+    session = TelnetSession(display)
+    planner = OllamaPlanner(
+        send_callback=lambda cmd: session.send_command(cmd, source="ollama"),
+        knowledge_text=knowledge_text,
+        enabled=OLLAMA_ENABLED,
+    )
+    session.attach_planner(planner)
+
+    input_thread = ConsoleInputThread(session)
+    input_thread.start()
+
+    profile_index = 0
+    instructions_shown = False
 
 def run_client():
     display = TerminalDisplay()
