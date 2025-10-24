@@ -178,13 +178,13 @@ BASE_SCENARIO_SCRIPT: Tuple[str, ...] = (
 
 TriggerAction = Union[str, Callable[[], None], Callable[[re.Match[str]], None]]
 
-
 @dataclass
 class Trigger:
     pattern: re.Pattern[str]
     action: TriggerAction
     once: bool
     use_match: bool
+
 OutputHandler = Callable[[str, Optional[str]], None]
 
 
@@ -356,6 +356,7 @@ class T2TMUDClient:
             if command:
                 self.send(command)
             time.sleep(self.automation_delay)
+
 
 def print_out(text, _):
     cleaned = text.replace('\r\n', '\n').replace('\r', '\n')
