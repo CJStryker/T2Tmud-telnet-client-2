@@ -182,9 +182,7 @@ def configure_client(client):
 
         def _should_send(self, last_sent_at: float) -> bool:
             now = time.monotonic()
-            if now - last_sent_at < 1.0:
-                return False
-            return True
+            return (now - last_sent_at) >= 1.0
 
         def send_username(self):
             if not self._should_send(self.username_sent_at):
@@ -217,7 +215,12 @@ def configure_client(client):
         client.add_trigger(prompt, login.send_password, flags=re.IGNORECASE)
     client.add_trigger(LOGIN_SUCCESS_PATTERN, handle_login_success, flags=re.IGNORECASE)
     client.add_trigger(r"Welcome to Arda,\s+%s!" % re.escape(USERNAME), handle_login_success, flags=re.IGNORECASE)
-    client.add_trigger(r"Ragakh says in Westron: What is your name, young one\?", f"say {USERNAME}", flags=re.IGNORECASE, once=True)
+    client.add_trigger(
+        r"Ragakh says in Westron: What is your name, young one\?",
+        f"say {USERNAME}",
+        flags=re.IGNORECASE,
+        once=True,
+    )
 
 
 def create_configured_client():
