@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Deque, Iterable, List, Optional, Sequence
+from typing import Callable, Deque, Dict, Iterable, List, Match, Optional, Sequence
 import http.client
 
 ###############################################################################
@@ -51,6 +51,16 @@ TRAVELTO_START_PATTERN = re.compile(r"Travelto:\s+Journey begun", re.IGNORECASE)
 TRAVELTO_ABORT_PATTERN = re.compile(r"Travelto:\s+aborted", re.IGNORECASE)
 TRAVELTO_RESUME_PATTERN = re.compile(r"Travelto:\s+resuming journey", re.IGNORECASE)
 TRAVELTO_COMPLETE_PATTERN = re.compile(r"Travelto:\s+(?:Journey complete|arrived)", re.IGNORECASE)
+NO_GOLD_PATTERN = re.compile(r"You don't have enough gold", re.IGNORECASE)
+RENT_ROOM_REQUIRED_PATTERN = re.compile(r"You have not rented a room", re.IGNORECASE)
+TRAVELTO_SIGNPOST_PATTERN = re.compile(r"Travelto can only be used at a signpost", re.IGNORECASE)
+SEARCH_FAIL_PATTERN = re.compile(r"You search but fail to find anything of interest\.", re.IGNORECASE)
+TARGET_LINE_PATTERN = re.compile(
+    r"^\s*(?:An?|The)\s+(?P<name>[^\[]+?)\s*\[(?P<level>\d+)\]\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+GOLD_STATUS_PATTERN = re.compile(r"Gold:\s*(?P<amount>\d+)", re.IGNORECASE)
+TARGET_MEMORY_SECONDS = 45.0
 
 
 class TerminalDisplay:
@@ -213,6 +223,23 @@ class GameKnowledge:
         "help <topic>",
     )
 
+    ECONOMY_COMMANDS: Sequence[str] = (
+        "list",
+        "value <item>",
+        "buy <item>",
+        "sell <item>",
+        "order <item>",
+        "rent room",
+        "deposit <amount>",
+        "withdraw <amount>",
+        "get coins",
+        "get all corpse",
+        "get <item> from corpse",
+        "give <amount> gold to <npc>",
+        "offer",
+        "pay <npc>",
+    )
+
     COMBAT_COMMANDS: Sequence[str] = (
         "kill <target>",
         "flee",
@@ -229,7 +256,10 @@ class GameKnowledge:
         "Interact with NPCs using 'say' and 'ask <npc> about <topic>'.",
         "Follow signposts with 'travelto <destination>' and let the journey finish before issuing other commands; resume with 'travelto resume' if paused.",
         "Seek supplies in taverns: 'order <item>', 'rent room', and 'rest' recover resources faster when others are nearby.",
-        "Share or collect gold thoughtfully using 'give <amount> gold to <npc>' or by exploring for valuables before renting rooms.",
+        "If gold is low, explore new rooms, search containers, loot corpses with 'get coins' or 'get all corpse', and sell excess gear before attempting large purchases.",
+        "Before engaging, 'consider <target>' to judge difficulty, focus on low-level creatures, and finish foes quickly to gather loot.",
+        "After combat, loot coins and valuables, then visit shops or innkeepers to buy food, gear, or lodging.",
+        "Follow rumours, message boards, and NPC dialogue for hints about hunting grounds or profitable activities.",
         "When help topics suggest more reading, queue follow-up 'help <topic>' calls.",
         "When '--More--' pagination appears, send a blank command to continue.",
         "Avoid repeating the same command rapidly if the game says you cannot do it.",
@@ -258,6 +288,7 @@ class GameKnowledge:
             fmt_section("Core exploration", cls.CORE_COMMANDS),
             fmt_section("Movement", cls.MOVEMENT_COMMANDS),
             fmt_section("Interaction", cls.INTERACTION_COMMANDS),
+            fmt_section("Economy", cls.ECONOMY_COMMANDS),
             fmt_section("Support", cls.SUPPORT_COMMANDS),
             fmt_section("Combat", cls.COMBAT_COMMANDS),
             "Guidelines: " + " ".join(cls.STRATEGY_GUIDELINES),
@@ -587,6 +618,8 @@ class TelnetSession:
         self._username_sent = False
         self._password_sent = False
         self._travel_active = False
+        self._recent_targets: Dict[str, float] = {}
+        self._last_gold_report: Optional[int] = None
 
     def attach_planner(self, planner: OllamaPlanner):
         self._planner = planner
@@ -717,6 +750,72 @@ class TelnetSession:
             self._buffer = TRAVELTO_ABORT_PATTERN.sub("", self._buffer)
             self._buffer = TRAVELTO_COMPLETE_PATTERN.sub("", self._buffer)
             return
+        match = NO_GOLD_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "Purchase failed due to insufficient gold")
+            if self._planner:
+                self._planner.note_event("Not enough gold to buy; seek coins or items to sell")
+                self._planner.request_commands("insufficient gold")
+            self._remove_match(match)
+            return
+        match = RENT_ROOM_REQUIRED_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "A room rental is required before entering that area")
+            if self._planner:
+                self._planner.note_event("Need to rent a room before entering private quarters")
+                self._planner.request_commands("rent room required")
+            self._remove_match(match)
+            return
+        match = TRAVELTO_SIGNPOST_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "Travelto can only be used at signposts; locate one first")
+            if self._planner:
+                self._planner.note_event("Travelto attempt failed away from signpost")
+                self._planner.request_commands("travelto signpost needed")
+            self._remove_match(match)
+            return
+        match = SEARCH_FAIL_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "Search revealed nothing; try other rooms or targets")
+            if self._planner:
+                self._planner.note_event("Search failed; consider new area or target")
+                self._planner.request_commands("search failed")
+            self._remove_match(match)
+            return
+        enemy_match = TARGET_LINE_PATTERN.search(self._buffer)
+        if enemy_match:
+            raw_name = enemy_match.group("name").strip()
+            level = enemy_match.group("level")
+            normalized = re.sub(r"\s+", " ", raw_name).lower()
+            now = time.monotonic()
+            if now - self._recent_targets.get(normalized, 0.0) > TARGET_MEMORY_SECONDS:
+                self._recent_targets[normalized] = now
+                message = f"Potential foe spotted: {raw_name} (lvl {level})"
+                self.display.emit("event", message)
+                if self._planner:
+                    self._planner.note_event(message)
+                    self._planner.request_commands("enemy spotted")
+            self._remove_match(enemy_match)
+            return
+        gold_matches = list(GOLD_STATUS_PATTERN.finditer(self._buffer))
+        if gold_matches:
+            last_match = gold_matches[-1]
+            amount = int(last_match.group("amount"))
+            if self._last_gold_report == amount:
+                self._remove_match(last_match)
+                return
+            self._last_gold_report = amount
+            if amount == 0:
+                message = "Gold purse is empty; gather coins before shopping"
+            else:
+                message = f"Gold on hand: {amount}"
+            self.display.emit("event", message)
+            if self._planner:
+                self._planner.note_event(message)
+                if amount == 0:
+                    self._planner.request_commands("gold depleted")
+            self._remove_match(last_match)
+            return
         if PROMPT_PATTERN.search(self._buffer):
             if self._travel_active:
                 self._consume(PROMPT_PATTERN)
@@ -746,6 +845,9 @@ class TelnetSession:
         if not match:
             return
         self._buffer = self._buffer[match.end():]
+
+    def _remove_match(self, match: Match[str]):
+        self._buffer = self._buffer[: match.start()] + self._buffer[match.end():]
 
 
 ###############################################################################
@@ -784,22 +886,6 @@ class ConsoleInputThread(threading.Thread):
 ###############################################################################
 # Application bootstrap
 ###############################################################################
-
-###############################################################################
-# Application bootstrap
-###############################################################################
-
-
-def run_client():
-    display = TerminalDisplay()
-    knowledge_text = GameKnowledge.build_reference()
-    session = TelnetSession(display)
-    planner = OllamaPlanner(
-        send_callback=lambda cmd: session.send_command(cmd, source="ollama"),
-        knowledge_text=knowledge_text,
-        enabled=OLLAMA_ENABLED,
-    )
-    session.attach_planner(planner)
 
     profile = DEFAULT_PROFILES[0]
     try:
