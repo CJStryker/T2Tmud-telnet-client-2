@@ -1769,6 +1769,32 @@ class ConsoleInputThread(threading.Thread):
 # Application bootstrap
 ###############################################################################
 
+###############################################################################
+# Application bootstrap
+###############################################################################
+
+
+def run_client():
+    display = TerminalDisplay()
+    if not DEFAULT_PROFILES:
+        display.emit("error", "No character profiles configured.")
+        display.ensure_newline()
+        return
+
+    knowledge_text = GameKnowledge.build_reference()
+    session = TelnetSession(display)
+    planner = OllamaPlanner(
+        send_callback=lambda cmd: session.send_command(cmd, source="ollama"),
+        knowledge_text=knowledge_text,
+        enabled=OLLAMA_ENABLED,
+    )
+    session.attach_planner(planner)
+
+    input_thread = ConsoleInputThread(session)
+    input_thread.start()
+
+    profile_index = 0
+    instructions_shown = False
 
 def run_client():
     display = TerminalDisplay()
