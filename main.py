@@ -66,7 +66,7 @@ HOST, PORT = 't2tmud.org', 9999
 
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', '69.142.141.135')
 OLLAMA_PORT = int(os.getenv('OLLAMA_PORT', '11434'))
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3')
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:4b')
 OLLAMA_ENABLED = os.getenv('ENABLE_OLLAMA', '1').lower() not in {'0', 'false', 'no'}
 
 ENEMY_KEYWORDS = (
@@ -248,6 +248,9 @@ class OllamaCommandController:
         self._help_topics: "OrderedDict[str, float]" = OrderedDict()
         self._help_topic_limit = 40
         self._last_exit_options: Tuple[str, ...] = ()
+        self._events: Deque[str] = deque(maxlen=120)
+        self._command_outcomes: Deque[str] = deque(maxlen=60)
+        self._last_error: str = ""
         self._lock = threading.Lock()
         self._http: Optional[urllib3.PoolManager] = None
         self._pending_request = threading.Event()
@@ -274,6 +277,9 @@ class OllamaCommandController:
             self._command_history.clear()
             self._help_topics.clear()
             self._last_exit_options = ()
+            self._events.clear()
+            self._command_outcomes.clear()
+            self._last_error = ""
 
     def handle_output(self, text: str, _meta: Optional[str]):
         if not self.enabled:
@@ -294,6 +300,40 @@ class OllamaCommandController:
             self._command_history.append(cleaned)
             self._history.append(f">>> {cleaned}\n")
 
+    def record_event(self, event: str):
+        if not self.enabled:
+            return
+        cleaned = event.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self._events.append(cleaned)
+            self._history.append(f"[event] {cleaned}\n")
+
+    def record_command_outcome(self, command: str, outcome: str):
+        if not self.enabled:
+            return
+        outcome_text = outcome.strip()
+        if not outcome_text:
+            return
+        cleaned_command = command.strip()
+        if cleaned_command:
+            entry = f"{cleaned_command} -> {outcome_text}"
+        else:
+            entry = outcome_text
+        with self._lock:
+            self._command_outcomes.append(entry)
+            self._history.append(f"[outcome] {entry}\n")
+
+    def record_error(self, message: str):
+        if not self.enabled:
+            return
+        cleaned = message.strip()
+        with self._lock:
+            self._last_error = cleaned
+            if cleaned:
+                self._history.append(f"[error] {cleaned}\n")
+
     def record_help_topic(self, topic: str):
         if not self.enabled:
             return
@@ -308,6 +348,7 @@ class OllamaCommandController:
             while len(self._help_topics) > self._help_topic_limit:
                 self._help_topics.popitem(last=False)
             self._history.append(f"[help] {cleaned}\n")
+            self._events.append(f"Reviewing help topic '{cleaned}'")
 
     def record_exit_options(self, exits: List[str]):
         if not self.enabled:
@@ -321,6 +362,7 @@ class OllamaCommandController:
             self._last_exit_options = normalized
             pretty = ', '.join(normalized)
             self._history.append(f"[exits] {pretty}\n")
+            self._events.append(f"Exits available: {pretty}")
 
     def request_commands(self):
         if not self.enabled:
@@ -341,18 +383,38 @@ class OllamaCommandController:
                 self.client.queue_script(commands)
                 self.client.start_automation()
                 self._cooldown_until = time.monotonic() + 1.5
+            else:
+                self._cooldown_until = time.monotonic() + 3.0
 
     def _generate_commands(self) -> List[str]:
-        context, recent_commands, help_topics, exits = self._collect_context_bundle()
+        (
+            context,
+            recent_commands,
+            help_topics,
+            exits,
+            outcomes,
+            events,
+            last_error,
+        ) = self._collect_context_bundle()
         if not context:
             return []
-        prompt = self._build_prompt(context, recent_commands, help_topics, exits)
+        prompt = self._build_prompt(
+            context,
+            recent_commands,
+            help_topics,
+            exits,
+            outcomes,
+            events,
+            last_error,
+        )
         response_text = self._query_ollama(prompt)
         if not response_text:
             return []
         return self._extract_commands(response_text)
 
-    def _collect_context_bundle(self) -> Tuple[str, List[str], List[str], List[str]]:
+    def _collect_context_bundle(
+        self,
+    ) -> Tuple[str, List[str], List[str], List[str], List[str], List[str], str]:
         with self._lock:
             if not self._history:
                 history = ""
@@ -361,9 +423,12 @@ class OllamaCommandController:
             commands = list(self._command_history)[-12:]
             topics = [topic for topic, _ in list(self._help_topics.items())[-12:]]
             exits = list(self._last_exit_options)
+            outcomes = list(self._command_outcomes)[-8:]
+            events = list(self._events)[-10:]
+            last_error = self._last_error
         if len(history) > self.max_context_chars:
             history = history[-self.max_context_chars :]
-        return history, commands, topics, exits
+        return history, commands, topics, exits, outcomes, events, last_error
 
     def _build_prompt(
         self,
@@ -371,6 +436,9 @@ class OllamaCommandController:
         commands: List[str],
         help_topics: List[str],
         exits: List[str],
+        outcomes: List[str],
+        events: List[str],
+        last_error: str,
     ) -> str:
         guidance = (
             "You are controlling a player character connected via telnet to The Two "
@@ -394,6 +462,16 @@ class OllamaCommandController:
             )
         if exits:
             metadata_lines.append("Most recent exits seen: " + ', '.join(exits))
+        if outcomes:
+            metadata_lines.append(
+                "Recent command outcomes: " + '; '.join(outcomes[-6:])
+            )
+        if events:
+            metadata_lines.append(
+                "Recent observations: " + '; '.join(events[-6:])
+            )
+        if last_error:
+            metadata_lines.append("Last Ollama error: " + last_error)
         metadata = "\n".join(metadata_lines)
         if metadata:
             metadata = f"\nContext summary:\n{metadata}\n"
@@ -421,18 +499,22 @@ class OllamaCommandController:
             )
         except Exception as exc:  # pragma: no cover - network failure logging
             print(f"[ollama] request failed: {exc}", file=sys.stderr)
+            self.record_error(str(exc))
             return ""
 
         if response.status != 200:
             print(f"[ollama] HTTP {response.status}", file=sys.stderr)
+            self.record_error(f"HTTP {response.status}")
             return ""
 
         try:
             data = json.loads(response.data.decode('utf-8'))
         except json.JSONDecodeError:
             print("[ollama] invalid JSON response", file=sys.stderr)
+            self.record_error("invalid JSON response")
             return ""
-
+        with self._lock:
+            self._last_error = ""
         return data.get('response', '')
 
     def _extract_commands(self, text: str) -> List[str]:
@@ -744,6 +826,18 @@ def configure_client(
             if self.ollama:
                 self.ollama.reset_context()
 
+        def _last_client_command(self) -> str:
+            for direction, message in reversed(client.log):
+                if direction == 'client' and message and not message.startswith('Connection'):
+                    return message
+            return ""
+
+        def _note_command_issue(self, summary: str):
+            if not self.ollama:
+                return
+            last_cmd = self._last_client_command()
+            self.ollama.record_command_outcome(last_cmd, summary)
+
         def greet(self, match: re.Match[str]):
             speaker = match.group('speaker').strip()
             key = speaker.lower()
@@ -873,6 +967,7 @@ def configure_client(
                 commands.append("hint")
             client.queue_script(commands)
             if self.ollama:
+                self.ollama.record_event(f"Hint responded to: {hint_text}")
                 self.ollama.request_commands()
 
         def handle_unknown_command(self, _match: Optional[re.Match[str]] = None):
@@ -881,15 +976,19 @@ def configure_client(
                 client.queue_script(["hint"])
             elif self.unknown_command_count >= 2:
                 self._request_help("commands")
+            self._note_command_issue("Received 'What?' response")
 
         def handle_blocked_path(self, _match: Optional[re.Match[str]] = None):
             self.blocked_attempts += 1
             self.queue_next_exit(alternate=True)
             if self.blocked_attempts >= 2:
                 self._request_help("movement")
+            self._note_command_issue("Movement blocked")
 
         def handle_ask_prompt(self, _match: Optional[re.Match[str]] = None):
             self._request_help("ask")
+            if self.ollama:
+                self.ollama.record_event("Prompted to ask about a topic")
 
         def respond_to_help_me(self, match: re.Match[str]):
             npc = match.group('npc').strip()
@@ -909,6 +1008,8 @@ def configure_client(
                     f"ask {name_token} about work",
                 ]
             )
+            if self.ollama:
+                self.ollama.record_event(f"Engaging with {npc} for assistance")
 
         def handle_board(self, _match: Optional[re.Match[str]] = None):
             now = time.monotonic()
@@ -916,10 +1017,14 @@ def configure_client(
                 return
             self.last_board_check = now
             client.queue_script(["look board", "read board", "read board all"])
+            if self.ollama:
+                self.ollama.record_event("Reviewing message board")
 
         def handle_shop_direction(self, match: re.Match[str]):
             direction = match.group('direction').lower()
             client.queue_script(self._commands_for_direction(direction))
+            if self.ollama:
+                self.ollama.record_event(f"Shop hinted to the {direction}")
 
         def handle_help_suggestion(self, match: re.Match[str]):
             topic = match.group('topic').strip().lower()
@@ -928,17 +1033,25 @@ def configure_client(
                 return
             self.last_hint_follow_up = now
             client.queue_script([f"help {topic}", "hint"])
+            if self.ollama:
+                self.ollama.record_event(f"Following help suggestion for '{topic}'")
 
         def handle_wake_up(self, _match: Optional[re.Match[str]] = None):
             client.queue_script(["look", "inventory", "score"])
+            if self.ollama:
+                self.ollama.record_event("Regained consciousness")
 
         def handle_travel_advice(self, match: re.Match[str]):
             npc = match.group('npc').strip().lower()
             topic = re.split(r"\s+", npc)[0]
             client.queue_script([f"help {topic}", f"where {topic}", "hint"])
+            if self.ollama:
+                self.ollama.record_event(f"Received travel advice about {topic}")
 
         def thank_driver(self, _match: Optional[re.Match[str]] = None):
             client.queue_script(["say Thank you, driver.", "wave driver"])
+            if self.ollama:
+                self.ollama.record_event("Thanked the driver")
 
         def handle_empty_search(self, _match: Optional[re.Match[str]] = None):
             now = time.monotonic()
@@ -947,6 +1060,7 @@ def configure_client(
             self.last_search_fail = now
             self.queue_next_exit(alternate=True)
             client.queue_script(["look", "hint"])
+            self._note_command_issue("Search returned nothing")
 
         def handle_empty_take(self, _match: Optional[re.Match[str]] = None):
             now = time.monotonic()
@@ -954,6 +1068,7 @@ def configure_client(
                 return
             self.last_empty_take = now
             client.queue_script(["inventory", "search", "hint"])
+            self._note_command_issue("No items available to take")
 
         def handle_not_found(self, _match: Optional[re.Match[str]] = None):
             now = time.monotonic()
@@ -962,6 +1077,7 @@ def configure_client(
             self.last_not_found = now
             self.queue_next_exit(alternate=True)
             client.queue_script(["look", "hint"])
+            self._note_command_issue("Target not found in room")
 
         def handle_no_help_topic(self, _match: Optional[re.Match[str]] = None):
             now = time.monotonic()
@@ -969,11 +1085,13 @@ def configure_client(
                 return
             self.no_help_topic_recent = now
             client.queue_script(["help list", "hint"])
+            self._note_command_issue("Help topic unavailable")
 
         def handle_status_prompt(self, _match: Optional[re.Match[str]] = None):
             self.awaiting_more = False
             self.schedule_quit_if_ready()
             if self.ollama and not self.awaiting_more:
+                self.ollama.record_event("Status prompt ready for next action")
                 self.ollama.request_commands()
 
         def handle_help_header(self, match: re.Match[str]):
@@ -982,6 +1100,7 @@ def configure_client(
             topic = match.group('topic').strip()
             if self.ollama and topic:
                 self.ollama.record_help_topic(topic)
+                self.ollama.record_event(f"Reading help header '{topic}'")
             self.help_topics_read += 1
             self.schedule_quit_if_ready()
             if self.ollama:
@@ -999,13 +1118,21 @@ def configure_client(
             self.help_topics_seen[normalized] = now
             client.queue_script([f"help {topic.lower()}"])
             if self.ollama:
+                self.ollama.record_event(f"Queuing help topic '{topic.lower()}' from list")
                 self.ollama.request_commands()
 
-        def handle_more_prompt(self, _match: Optional[re.Match[str]] = None):
+        def handle_more_prompt(self, match: Optional[re.Match[str]] = None):
             now = time.monotonic()
             self.awaiting_more = True
             previous = self.last_more_prompt
             self.last_more_prompt = now
+            percent = None
+            if match:
+                percent = match.groupdict().get('percent') if match.groupdict() else None
+            if percent and self.ollama:
+                self.ollama.record_event(f"Help pagination at {percent}%")
+            elif self.ollama:
+                self.ollama.record_event("Encountered pagination prompt")
             if now - previous > 0.35:
                 client.send("")
 
@@ -1013,11 +1140,14 @@ def configure_client(
             self.awaiting_more = True
             self.last_more_prompt = time.monotonic()
             client.send("")
+            self._note_command_issue("Pagination command not understood")
 
         def handle_press_enter_prompt(self, _match: Optional[re.Match[str]] = None):
             self.awaiting_more = True
             self.last_more_prompt = time.monotonic()
             client.send("")
+            if self.ollama:
+                self.ollama.record_event("Prompted to press enter during help")
 
         def should_pause_automation(self) -> bool:
             if not self.awaiting_more:
@@ -1062,6 +1192,8 @@ def configure_client(
             self.last_exit_choice_index = next_index
             direction = self.last_exit_options[self.last_exit_choice_index]
             client.queue_script(self._commands_for_direction(direction))
+            if self.ollama:
+                self.ollama.record_event(f"Attempting exit '{direction}'")
 
         def handle_exits(self, match: re.Match[str]):
             exits_text = match.group('exits')
@@ -1087,6 +1219,38 @@ def configure_client(
                 self.ollama.record_exit_options(list(normalized_options))
                 self.ollama.request_commands()
             client.queue_script(self._commands_for_direction(direction))
+
+        def handle_standard_exits(self, match: re.Match[str]):
+            block = match.group('block') or ''
+            options = [
+                direction.strip().lower()
+                for direction in re.findall(r"^\s*([A-Za-z]+):", block, flags=re.IGNORECASE | re.MULTILINE)
+            ]
+            if not options:
+                return
+            self.last_exit_options = tuple(options)
+            self.last_exit_choice_index = 0
+            if self.ollama:
+                self.ollama.record_exit_options(options)
+                self.ollama.record_event("Standard exits listed: " + ', '.join(options))
+                self.ollama.request_commands()
+            client.queue_script(self._commands_for_direction(options[0]))
+
+        def handle_unable_to_bearings(self, _match: Optional[re.Match[str]] = None):
+            self._note_command_issue("Could not use map in this area")
+            client.queue_script(["help map", "hint"])
+            if self.ollama:
+                self.ollama.record_event("Unable to get bearings in this room")
+
+        def handle_missing_messenger(self, _match: Optional[re.Match[str]] = None):
+            self._note_command_issue("Messenger not present")
+            client.queue_script(["look", "hint"])
+            if self.ollama:
+                self.ollama.record_event("Messenger was not available")
+
+        def handle_common_skills(self, _match: Optional[re.Match[str]] = None):
+            if self.ollama:
+                self.ollama.record_event("Viewed common skills list")
 
         def _commands_for_direction(self, direction: str) -> List[str]:
             commands: List[str] = []
@@ -1214,6 +1378,12 @@ def configure_client(
         flags=re.IGNORECASE,
         use_match=True,
     )
+    client.add_trigger(
+        r"Standard exits:(?P<block>(?:\n\s*[A-Za-z]+:[^\n]+)+)",
+        world.handle_standard_exits,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
     client.add_trigger(r"\bWhat\?\s*$", world.handle_unknown_command, flags=re.MULTILINE)
     client.add_trigger(
         r"You can't go that way!",
@@ -1296,9 +1466,25 @@ def configure_client(
         flags=re.IGNORECASE,
     )
     client.add_trigger(
-        r"--More--",
+        r"You are unable to get your bearings from here\.",
+        world.handle_unable_to_bearings,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"Messenger is nowhere to be found\.",
+        world.handle_missing_messenger,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"Common Skills:",
+        world.handle_common_skills,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"--More--(?:\((?P<percent>\d+)%\s+line\s+(?P<line>\d+)\s+of\s+(?P<total>\d+)\)--)?",
         world.handle_more_prompt,
         flags=re.IGNORECASE,
+        use_match=True,
     )
     client.add_trigger(
         r"Press ENTER for next page",
