@@ -19,6 +19,7 @@ USERNAME_PROMPTS = (
     r"Enter your character name:",
     r"Enter your name:",
     r"Your name\??",
+    r"Please enter the name 'new' if you are new to The Two Towers\.",
 )
 PASSWORD_PROMPTS = (
     r"What is your password\??",
@@ -62,16 +63,27 @@ class T2TMUDClient:
         if not self.connection:
             print("Error: connection is not established")
             return
+
         try:
             while True:
-                data = self.connection.read_until(b'\n').decode('ascii', errors='ignore')
+                raw = self.connection.read_very_eager()
+                if not raw:
+                    time.sleep(0.05)
+                    continue
+
+                data = raw.decode('ascii', errors='ignore')
                 if not data:
-                    break
-                self.log.append(('server', data.strip()))
+                    continue
+
+                self.log.append(('server', data.replace('\r', '')))
                 if self.output:
                     self.output(data, None)
                 self.check_triggers(data)
         except EOFError:
+            self.log.append(('error', 'Connection closed.'))
+            if self.output:
+                self.output("Connection closed.\n", None)
+        except OSError:
             self.log.append(('error', 'Connection closed.'))
             if self.output:
                 self.output("Connection closed.\n", None)
