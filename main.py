@@ -69,6 +69,9 @@ def supports_color() -> bool:
 COLOR_ENABLED = supports_color()
 
 
+_partial_line_pending = False
+
+
 def apply_color(line: str) -> str:
     if not COLOR_ENABLED:
         return line
@@ -90,14 +93,56 @@ def apply_color(line: str) -> str:
 
 
 def print_output(text: str):
+    global _partial_line_pending
+    if not text:
+        return
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = text.split("\n")
-    for line in lines[:-1]:
-        print(apply_color(line))
-    if lines[-1]:
-        print(apply_color(lines[-1]), end="")
-    else:
-        sys.stdout.flush()
+    if _partial_line_pending and text.lstrip().startswith(("[event]", "[error]")):
+        sys.stdout.write("\n")
+        _partial_line_pending = False
+    for chunk in text.splitlines(keepends=True) or [text]:
+        if not chunk:
+            continue
+        if chunk.endswith("\n"):
+            content = chunk[:-1]
+            sys.stdout.write(apply_color(content))
+            sys.stdout.write("\n")
+            _partial_line_pending = False
+        else:
+            sys.stdout.write(apply_color(chunk))
+            _partial_line_pending = True
+    if text.endswith("\n"):
+        _partial_line_pending = False
+    sys.stdout.flush()
+
+
+def _extract_json_object(text: str) -> Optional[str]:
+    start: Optional[int] = None
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start : index + 1]
+    return None
 
 
 @dataclass
@@ -272,10 +317,46 @@ class OllamaAgent:
         payload = payload.strip()
         if not payload:
             return []
+        data: Optional[object]
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
-            print_output("[error] Ollama returned invalid JSON\n")
+            data = None
+            for line in payload.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+            if data is None:
+                print_output("[error] Ollama returned invalid JSON\n")
+                return []
+        if isinstance(data, dict) and "commands" not in data and "response" in data:
+            response_payload = data.get("response", "")
+            if isinstance(response_payload, str):
+                response_payload = response_payload.strip()
+                nested: Optional[object] = None
+                if response_payload:
+                    try:
+                        nested = json.loads(response_payload)
+                    except json.JSONDecodeError:
+                        fragment = _extract_json_object(response_payload)
+                        if fragment:
+                            try:
+                                nested = json.loads(fragment)
+                            except json.JSONDecodeError:
+                                nested = None
+                if not isinstance(nested, dict):
+                    print_output("[error] Ollama response did not contain valid command JSON\n")
+                    return []
+                data = nested
+            else:
+                print_output("[error] Ollama response did not contain valid command JSON\n")
+                return []
+        if not isinstance(data, dict):
             return []
         commands = data.get("commands")
         if not isinstance(commands, list):
