@@ -57,6 +57,10 @@ NO_GOLD_PATTERN = re.compile(r"You don't have enough gold", re.IGNORECASE)
 RENT_ROOM_REQUIRED_PATTERN = re.compile(r"You have not rented a room", re.IGNORECASE)
 TRAVELTO_SIGNPOST_PATTERN = re.compile(r"Travelto can only be used at a signpost", re.IGNORECASE)
 SEARCH_FAIL_PATTERN = re.compile(r"You search but fail to find anything of interest\.", re.IGNORECASE)
+SEARCH_SUCCESS_PATTERN = re.compile(
+    r"You (?:find|discover|uncover|notice) (?P<discovery>[^.]+)\.",
+    re.IGNORECASE,
+)
 TARGET_LINE_PATTERN = re.compile(
     r"^\s*(?:An?|The)\s+(?P<name>[^\[]+?)\s*\[(?P<level>\d+)\]\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -108,6 +112,26 @@ CONSIDER_PATTERN = re.compile(
 SUGGEST_ACTION_PATTERN = re.compile(r"Perhaps it could be (?P<action>[a-z]+)", re.IGNORECASE)
 MAP_SUGGESTION_PATTERN = re.compile(r"use the 'map' command", re.IGNORECASE)
 HINT_SUGGESTION_PATTERN = re.compile(r"\*\*\* HINT \*\*\*\s*:\s*(?P<hint>.+)")
+EXPERIENCE_GAIN_PATTERN = re.compile(r"You gain (?P<xp>\d+) experience", re.IGNORECASE)
+COIN_GAIN_PATTERN = re.compile(
+    r"You (?:get|receive) (?P<amount>\d+) gold(?: coins?)?",
+    re.IGNORECASE,
+)
+ITEM_ACQUIRE_PATTERN = re.compile(
+    r"You (?:get|take|obtain) (?P<item>[^.]+)\.",
+    re.IGNORECASE,
+)
+LEVEL_UP_PATTERN = re.compile(
+    r"You have advanced to level (?P<level>\d+)",
+    re.IGNORECASE,
+)
+SKILL_IMPROVE_PATTERN = re.compile(
+    r"Your (?:skill|ability) in (?P<skill>[^ ]+) (?:has )?improved",
+    re.IGNORECASE,
+)
+REST_COMPLETE_PATTERN = re.compile(r"You feel rested", re.IGNORECASE)
+DOOR_OPENED_PATTERN = re.compile(r"You open the (?P<direction>[a-z]+) door", re.IGNORECASE)
+DOOR_LOCKED_PATTERN = re.compile(r"The (?P<direction>[a-z]+) door is locked", re.IGNORECASE)
 TARGET_MEMORY_SECONDS = 45.0
 
 
@@ -228,8 +252,6 @@ class GameKnowledge:
         "consider <target>",
         "journal",
         "notes",
-        "travelto <destination>",
-        "travelto resume",
         "search",
         "rest",
         "missions",
@@ -237,6 +259,30 @@ class GameKnowledge:
         "train",
         "save",
         "quit",
+    )
+
+    TRAVEL_COMMANDS: Sequence[str] = (
+        "travelto <destination>",
+        "travelto resume",
+        "map",
+        "exits",
+        "where",
+        "follow road",
+        "follow path",
+        "listen",
+        "scan",
+        "track <target>",
+        "search trail",
+        "sneak <direction>",
+        "camp",
+        "light torch",
+        "go <direction>",
+        "climb <object>",
+        "enter",
+        "leave",
+        "board <transport>",
+        "disembark",
+        "unlock <direction> door",
     )
 
     MOVEMENT_COMMANDS: Sequence[str] = (
@@ -255,12 +301,9 @@ class GameKnowledge:
         "out",
         "go <direction>",
         "open <direction> door",
-        "climb <object>",
         "lift <object>",
         "push <object>",
         "pull <object>",
-        "travelto <destination>",
-        "travelto resume",
         "follow <path>",
         "sneak <direction>",
         "run <direction>",
@@ -285,13 +328,6 @@ class GameKnowledge:
         "remove <item>",
         "give <item> to <npc>",
         "give <amount> gold to <npc>",
-        "ask <npc> about work",
-        "ask <npc> about rumours",
-        "ask <npc> about travel",
-        "ask <npc> about jobs",
-        "ask <npc> about quest",
-        "ask <npc> about gold",
-        "ask <npc> about rumours",
         "buy <item>",
         "sell <item>",
         "order <item>",
@@ -305,12 +341,12 @@ class GameKnowledge:
         "listen",
         "hint",
         "help <topic>",
-        "travelto resume",
-        "read news",
         "updates all",
         "study <object>",
         "smell",
         "taste",
+        "knock <door>",
+        "observe <object>",
     )
 
     ECONOMY_COMMANDS: Sequence[str] = (
@@ -329,9 +365,6 @@ class GameKnowledge:
         "give <amount> gold to <npc>",
         "offer",
         "pay <npc>",
-        "sell <item>",
-        "value <item>",
-        "list",
         "sell loot",
         "sell all corpse",
         "appraise <item>",
@@ -341,6 +374,10 @@ class GameKnowledge:
         "exchange <item>",
         "buy room",
         "tip <npc>",
+        "haggle",
+        "barter <item>",
+        "pawn <item>",
+        "collect reward",
     )
 
     COMBAT_COMMANDS: Sequence[str] = (
@@ -365,6 +402,10 @@ class GameKnowledge:
         "target <enemy>",
         "assist <ally>",
         "charge <target>",
+        "feint <target>",
+        "shield bash",
+        "guard <ally>",
+        "bandage <ally>",
     )
 
     QUEST_COMMANDS: Sequence[str] = (
@@ -378,6 +419,8 @@ class GameKnowledge:
         "news",
         "read news",
         "updates all",
+        "journal",
+        "notes",
     )
 
     HUNTING_COMMANDS: Sequence[str] = (
@@ -399,6 +442,8 @@ class GameKnowledge:
         "set trap",
         "stalk <target>",
         "aim",
+        "track scent",
+        "collect pelt",
     )
 
     SUPPORT_COMMANDS: Sequence[str] = (
@@ -423,6 +468,122 @@ class GameKnowledge:
         "prepare <item>",
         "memorize",
         "practice",
+        "group",
+        "assist <ally>",
+    )
+
+    SOCIAL_COMMANDS: Sequence[str] = (
+        "wave",
+        "smile",
+        "bow",
+        "thank <npc>",
+        "apologize",
+        "greet <npc>",
+        "introduce <name>",
+        "cheer",
+        "laugh",
+        "comm on",
+        "comm off",
+        "reply <message>",
+        "emote <message>",
+        "rp <message>",
+        "sing",
+        "dance",
+    )
+
+    CRAFTING_COMMANDS: Sequence[str] = (
+        "forge",
+        "smith",
+        "repair <item>",
+        "sharpen <weapon>",
+        "polish <armor>",
+        "enchant <item>",
+        "cook <item>",
+        "brew <potion>",
+        "mix <ingredient>",
+        "scribe <scroll>",
+        "study recipe",
+        "gather <resource>",
+        "mine <ore>",
+        "smelt <ore>",
+        "tan <hide>",
+        "sew <item>",
+        "assemble <object>",
+    )
+
+    UTILITY_COMMANDS: Sequence[str] = (
+        "diagnose",
+        "consider <target>",
+        "report",
+        "score",
+        "charinfo",
+        "legendinfo",
+        "config",
+        "brief",
+        "verbose",
+        "colour on",
+        "colour off",
+        "channels",
+        "alias",
+        "unalias",
+        "ignore <player>",
+        "ping",
+    )
+
+    WILDERNESS_COMMANDS: Sequence[str] = (
+        "forage",
+        "gather herbs",
+        "skin <corpse>",
+        "butcher <corpse>",
+        "set snare",
+        "light campfire",
+        "extinguish fire",
+        "fish",
+        "cast net",
+        "track <target>",
+        "hide",
+        "listen",
+        "scan",
+        "scent",
+        "survey",
+    )
+
+    TOWN_SERVICES: Sequence[str] = (
+        "bank",
+        "deposit <amount>",
+        "withdraw <amount>",
+        "balance",
+        "rent room",
+        "order <item>",
+        "buy <item>",
+        "sell <item>",
+        "list",
+        "value <item>",
+        "appraise <item>",
+        "heal",
+        "pray",
+        "train",
+        "practice",
+        "mission",
+        "quests",
+        "join <guild>",
+        "stable horse",
+    )
+
+    PROGRESSION_CHECKS: Sequence[str] = (
+        "score",
+        "quests",
+        "mission",
+        "legendinfo",
+        "charinfo",
+        "skills",
+        "train",
+        "practice",
+        "guilds",
+        "journal",
+        "notes",
+        "killboard",
+        "achievements",
     )
 
     PREPARATION_TIPS: Sequence[str] = (
@@ -438,6 +599,19 @@ class GameKnowledge:
         "Study help files for each profession to unlock unique abilities.",
         "Maintain a list of profitable hunting spots and rotate between them.",
         "Store quest-critical items safely in the bank until needed.",
+    )
+
+    SAFETY_REMINDERS: Sequence[str] = (
+        "Check HP and EP before every combat engagement.",
+        "Abort travelto if HP drops dangerously low during the journey.",
+        "Carry a light source in dark zones to avoid stumbling into hazards.",
+        "Avoid stealing from NPCs to prevent guard retaliation.",
+        "Retreat from creatures that your attacks cannot harm.",
+        "Rest after long hunts so energy regenerates before the next fight.",
+        "Deposit gold frequently to safeguard progress after successful hunts.",
+        "Keep antidotes or cure poison potions for swamp regions.",
+        "Use 'consider <target>' before starting fights with unknown foes.",
+        "Head back to town when stamina or supplies run low.",
     )
 
     STRATEGY_GUIDELINES: Sequence[str] = (
@@ -457,7 +631,6 @@ class GameKnowledge:
         "When help topics suggest more reading, queue follow-up 'help <topic>' calls.",
         "When '--More--' pagination appears, send a blank command to continue.",
         "Avoid repeating the same command rapidly if the game says you cannot do it.",
-        "Do not log out or switch characters unless explicitly asked.",
         "Only send in-game commands; never respond with narrative text.",
         "Record gold income and expenses; if funds drop to zero, hunt or sell items before attempting purchases.",
         "When NPCs refuse to help, leave the building and explore nearby paths for alternate opportunities.",
@@ -491,14 +664,22 @@ class GameKnowledge:
 
         sections = [
             fmt_section("Core exploration", cls.CORE_COMMANDS),
+            fmt_section("Travel", cls.TRAVEL_COMMANDS),
             fmt_section("Movement", cls.MOVEMENT_COMMANDS),
             fmt_section("Interaction", cls.INTERACTION_COMMANDS),
+            fmt_section("Utility", cls.UTILITY_COMMANDS),
             fmt_section("Economy", cls.ECONOMY_COMMANDS),
+            fmt_section("Town services", cls.TOWN_SERVICES),
             fmt_section("Support", cls.SUPPORT_COMMANDS),
+            fmt_section("Social", cls.SOCIAL_COMMANDS),
             fmt_section("Combat", cls.COMBAT_COMMANDS),
             fmt_section("Hunting", cls.HUNTING_COMMANDS),
+            fmt_section("Wilderness", cls.WILDERNESS_COMMANDS),
+            fmt_section("Crafting", cls.CRAFTING_COMMANDS),
             fmt_section("Quests", cls.QUEST_COMMANDS),
+            fmt_section("Progress tracking", cls.PROGRESSION_CHECKS),
             "Preparation: " + ", ".join(cls.PREPARATION_TIPS),
+            "Safety: " + ", ".join(cls.SAFETY_REMINDERS),
             "Guidelines: " + " ".join(cls.STRATEGY_GUIDELINES),
         ]
         return "\n".join(sections)
@@ -560,6 +741,7 @@ class OllamaPlanner:
         self._manual_commands: Deque[str] = deque(maxlen=20)
         self._events: Deque[str] = deque(maxlen=20)
         self._issues: Deque[str] = deque(maxlen=20)
+        self._opportunities: Deque[str] = deque(maxlen=12)
         self._lock = threading.Lock()
         self._pending_reason: Optional[str] = None
         self._request_event = threading.Event()
@@ -567,6 +749,7 @@ class OllamaPlanner:
         self._stop = threading.Event()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
+        self._issue_counts: Dict[str, int] = {}
         self._last_hp: Optional[int] = None
         self._last_ep: Optional[int] = None
         self._last_gold: Optional[int] = None
@@ -605,7 +788,9 @@ class OllamaPlanner:
             self._manual_commands.clear()
             self._events.clear()
             self._issues.clear()
+            self._opportunities.clear()
             self._pending_reason = None
+            self._issue_counts.clear()
             self._last_hp = None
             self._last_ep = None
             self._last_gold = None
@@ -769,7 +954,22 @@ class OllamaPlanner:
         if not cleaned:
             return
         with self._lock:
-            self._issues.append(cleaned)
+            count = self._issue_counts.get(cleaned, 0) + 1
+            self._issue_counts[cleaned] = count
+            if count == 1:
+                self._issues.append(cleaned)
+            elif count in {3, 5}:
+                self._issues.append(f"{cleaned} (x{count})")
+
+    def record_opportunity(self, message: str):
+        if not self.enabled:
+            return
+        cleaned = message.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self._opportunities.append(cleaned)
+            self._append_transcript(f"[opportunity] {cleaned}\n")
 
     def record_command(self, command: str, source: str):
         if not self.enabled:
@@ -838,6 +1038,7 @@ class OllamaPlanner:
             manual = list(self._manual_commands)[-6:]
             events = list(self._events)[-8:]
             issues = list(self._issues)[-8:]
+            opportunities = list(self._opportunities)[-6:]
             reason = self._pending_reason or ""
             self._pending_reason = None
             hp = self._last_hp
@@ -858,6 +1059,8 @@ class OllamaPlanner:
             summary_lines.append("Player-entered commands: " + ", ".join(manual))
         if events:
             summary_lines.append("Notable events: " + "; ".join(events))
+        if opportunities:
+            summary_lines.append("Opportunities: " + "; ".join(opportunities))
         if location_history:
             ordered: List[str] = []
             for entry in location_history:
@@ -1323,6 +1526,7 @@ class TelnetSession:
             )
             if self._planner:
                 self._planner.note_event(f"Path continues {directions}")
+                self._planner.record_opportunity(f"New route available {directions}")
             self._remove_match(path_match)
         city_match = CITY_NEAR_PATTERN.search(self._buffer)
         if city_match:
@@ -1334,6 +1538,7 @@ class TelnetSession:
             )
             if self._planner:
                 self._planner.note_event(f"City {city} located {direction}")
+                self._planner.record_opportunity(f"City {city} accessible {direction}")
             self._remove_match(city_match)
         forge_match = FORGE_PATH_PATTERN.search(self._buffer)
         if forge_match:
@@ -1344,6 +1549,7 @@ class TelnetSession:
             if self._planner:
                 self._planner.record_issue("Forge entrance available for crafting or trade")
                 self._planner.request_commands("forge entrance")
+                self._planner.record_opportunity("Forge nearby; craft or repair gear")
             self._remove_match(forge_match)
         action_hint_match = SUGGEST_ACTION_PATTERN.search(self._buffer)
         if action_hint_match:
@@ -1355,6 +1561,7 @@ class TelnetSession:
             if self._planner:
                 self._planner.record_issue(f"Try to {action} the highlighted object")
                 self._planner.request_commands(f"try to {action}")
+                self._planner.record_opportunity(f"Room encourages you to {action}")
             self._remove_match(action_hint_match)
         map_hint_match = MAP_SUGGESTION_PATTERN.search(self._buffer)
         if map_hint_match:
@@ -1363,6 +1570,104 @@ class TelnetSession:
                 self._planner.note_event("Game suggested using map command")
                 self._planner.request_commands("map hint")
             self._remove_match(map_hint_match)
+            return
+        xp_match = EXPERIENCE_GAIN_PATTERN.search(self._buffer)
+        if xp_match:
+            xp = xp_match.group("xp")
+            message = f"Experience gained: {xp}"
+            self.display.emit("event", message)
+            if self._planner:
+                self._planner.note_event(message)
+                self._planner.record_opportunity("Recent victory yielded experience; consider pressing the advantage")
+                self._planner.request_commands("experience gained")
+            self._remove_match(xp_match)
+            return
+        level_match = LEVEL_UP_PATTERN.search(self._buffer)
+        if level_match:
+            level = level_match.group("level")
+            message = f"Level up! Now level {level}. Visit trainers for upgrades"
+            self.display.emit("event", message)
+            if self._planner:
+                self._planner.note_event(message)
+                self._planner.record_opportunity("Level increased; visit trainers or spend new skill points")
+                self._planner.request_commands("level up")
+            self._remove_match(level_match)
+            return
+        skill_match = SKILL_IMPROVE_PATTERN.search(self._buffer)
+        if skill_match:
+            skill = skill_match.group("skill").strip()
+            message = f"Skill improved: {skill}"
+            self.display.emit("event", message)
+            if self._planner:
+                self._planner.note_event(message)
+                self._planner.record_opportunity(f"Skill {skill} improved; seek tougher challenges")
+                self._planner.request_commands("skill improved")
+            self._remove_match(skill_match)
+            return
+        coin_match = COIN_GAIN_PATTERN.search(self._buffer)
+        if coin_match:
+            amount = int(coin_match.group("amount"))
+            message = f"Collected {amount} gold coins"
+            self.display.emit("event", message)
+            self._gold_failures = 0
+            if self._planner:
+                self._planner.note_event(message)
+                self._planner.record_opportunity("Gold reserves growing; consider visiting shops or banks")
+                self._planner.request_commands("gold collected")
+            self._remove_match(coin_match)
+            return
+        item_match = ITEM_ACQUIRE_PATTERN.search(self._buffer)
+        if item_match:
+            item = item_match.group("item").strip()
+            if item and "gold" not in item.lower():
+                message = f"Acquired item: {item}"
+                self.display.emit("event", message)
+                if self._planner:
+                    self._planner.note_event(message)
+                    self._planner.record_opportunity(f"Evaluate newly acquired {item} for use or sale")
+                    self._planner.request_commands("item acquired")
+            self._remove_match(item_match)
+            return
+        search_success_match = SEARCH_SUCCESS_PATTERN.search(self._buffer)
+        if search_success_match:
+            discovery = search_success_match.group("discovery").strip()
+            self._search_failures = 0
+            message = f"Search uncovered {discovery}"
+            self.display.emit("event", message)
+            if self._planner:
+                self._planner.note_event(message)
+                self._planner.record_opportunity(f"Investigate discovered {discovery}")
+                self._planner.request_commands("search success")
+            self._remove_match(search_success_match)
+            return
+        rest_complete_match = REST_COMPLETE_PATTERN.search(self._buffer)
+        if rest_complete_match:
+            self.display.emit("event", "Rest completed; HP/EP refreshed")
+            if self._planner:
+                self._planner.note_event("Rest completed")
+                self._planner.update_rest_state("rested")
+                self._planner.record_opportunity("Recovered energy; resume exploration or hunting")
+                self._planner.request_commands("rest complete")
+            self._remove_match(rest_complete_match)
+            return
+        door_open_match = DOOR_OPENED_PATTERN.search(self._buffer)
+        if door_open_match:
+            direction = door_open_match.group("direction").lower()
+            self.display.emit("event", f"{direction.title()} door opened; proceed through before it closes")
+            if self._planner:
+                self._planner.note_event(f"Opened {direction} door")
+                self._planner.request_commands("door opened")
+            self._remove_match(door_open_match)
+            return
+        door_locked_match = DOOR_LOCKED_PATTERN.search(self._buffer)
+        if door_locked_match:
+            direction = door_locked_match.group("direction").lower()
+            self.display.emit("event", f"The {direction} door is locked; find a key or alternate route")
+            if self._planner:
+                self._planner.record_issue(f"{direction.title()} door locked")
+                self._planner.request_commands("door locked")
+            self._remove_match(door_locked_match)
+            return
         hint_match = HINT_SUGGESTION_PATTERN.search(self._buffer)
         if hint_match:
             hint_text = hint_match.group("hint").strip()
@@ -1769,32 +2074,6 @@ class ConsoleInputThread(threading.Thread):
 # Application bootstrap
 ###############################################################################
 
-###############################################################################
-# Application bootstrap
-###############################################################################
-
-
-def run_client():
-    display = TerminalDisplay()
-    if not DEFAULT_PROFILES:
-        display.emit("error", "No character profiles configured.")
-        display.ensure_newline()
-        return
-
-    knowledge_text = GameKnowledge.build_reference()
-    session = TelnetSession(display)
-    planner = OllamaPlanner(
-        send_callback=lambda cmd: session.send_command(cmd, source="ollama"),
-        knowledge_text=knowledge_text,
-        enabled=OLLAMA_ENABLED,
-    )
-    session.attach_planner(planner)
-
-    input_thread = ConsoleInputThread(session)
-    input_thread.start()
-
-    profile_index = 0
-    instructions_shown = False
 
 def run_client():
     display = TerminalDisplay()
