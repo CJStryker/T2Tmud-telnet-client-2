@@ -1,15 +1,17 @@
 import json
 import os
+import re
 import sys
 import telnetlib
 import threading
 import time
-import re
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Optional, Tuple, Union
 
 import urllib3
+from urllib3.exceptions import HTTPError, MaxRetryError, ReadTimeoutError
+from urllib3.util.retry import Retry
 
 DEFAULT_AUTOMATION_COMMANDS = (
     "look",
@@ -62,7 +64,569 @@ RECONNECT_PROMPTS = (
     r"^Connection restored\.\s*$",
     r"^Connection established\.\s*$",
 )
-HOST, PORT = 't2tmud.org', 9999
+HOST, PORT = "t2tmud.org", 9999
+
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "69.142.141.135")
+OLLAMA_PORT = int(os.getenv("OLLAMA_PORT", "11434"))
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+OLLAMA_CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "5.0"))
+OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "60.0"))
+OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "2"))
+OLLAMA_ENABLED = os.getenv("ENABLE_OLLAMA", "1").lower() not in {"0", "false", "no"}
+
+COLOR_OUTPUT = os.getenv("ENABLE_COLOR", "1").lower() not in {"0", "false", "no"}
+
+ANSI_RESET = "\033[0m"
+ANSI_COLORS = {
+    "prompt": "\033[38;5;82m",
+    "hint": "\033[38;5;220m",
+    "help": "\033[38;5;39m",
+    "more": "\033[38;5;213m",
+    "event": "\033[38;5;208m",
+}
+
+COLOR_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^HP:\s*\d+\s+EP:\s*\d+>"), "prompt"),
+    (re.compile(r"^\*\*\* HINT \*\*\*"), "hint"),
+    (re.compile(r"^Help for "), "help"),
+    (re.compile(r"--More--"), "more"),
+    (re.compile(r"^\[event]"), "event"),
+)
+
+
+def _supports_color() -> bool:
+    if not COLOR_OUTPUT:
+        return False
+    term = os.getenv("TERM", "")
+    return sys.stdout.isatty() and term.lower() not in {"", "dumb"}
+
+
+COLOR_ENABLED = _supports_color()
+
+
+def _colorize_line(line: str) -> str:
+    for pattern, color_key in COLOR_PATTERNS:
+        if pattern.search(line):
+            color = ANSI_COLORS.get(color_key)
+            if color:
+                return f"{color}{line}{ANSI_RESET}"
+    return line
+
+
+def colorize_output(text: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    lines = text.split("\n")
+    colored_lines = [_colorize_line(line) for line in lines]
+    return "\n".join(colored_lines)
+
+
+ENEMY_KEYWORDS = (
+    "slug",
+    "beetle",
+    "rat",
+    "wolf",
+    "brigand",
+    "bandit",
+    "thief",
+    "cutthroat",
+    "goblin",
+)
+
+TALKATIVE_NPC_KEYWORDS = {
+    "corsair": ("work", "rumours"),
+    "messenger": ("rumours", "news"),
+    "butler": ("overseer", "town"),
+    "trainer": ("training", "lessons"),
+    "ragakh": ("training", "camp"),
+    "driver": ("travel", "help"),
+}
+
+
+@dataclass
+class CharacterProfile:
+    username: str
+    password: str
+    intro_script: Tuple[str, ...] = ()
+    automation_commands: Optional[Tuple[str, ...]] = None
+
+
+CHARACTER_PROFILES: Tuple[CharacterProfile, ...] = (
+    CharacterProfile(
+        username="Marchos",
+        password="hello123",
+        intro_script=(
+            "who",
+            "where",
+            "weather",
+            "equipment",
+            "skills",
+            "quests",
+            "help newbie",
+            "help commands",
+            "help movement",
+            "rumours",
+            "look board",
+            "read board",
+            "updates all",
+            "hint",
+        ),
+    ),
+    CharacterProfile(
+        username="Zesty",
+        password="poopie",
+        intro_script=(
+            "who",
+            "where",
+            "equipment",
+            "skills",
+            "score",
+            "map",
+            "help hint",
+            "help combat",
+            "rumours",
+            "hint",
+        ),
+    ),
+)
+
+BASE_SCENARIO_SCRIPT: Tuple[str, ...] = (
+    "look",
+    "say Greetings, everyone!",
+    "hint",
+    "help",
+    "help newbie",
+    "help commands",
+    "help combat",
+    "help survival",
+    "help movement",
+    "help start",
+    "help help",
+    "help rules",
+    "help concepts",
+    "help theme",
+    "help list",
+    "help map",
+    "help hint",
+    "help guilds",
+    "help quests",
+    "help faq",
+    "faq",
+    "score",
+    "inventory",
+    "equipment",
+    "skills",
+    "hint",
+    "read sign",
+    "look sign",
+    "map",
+    "read map",
+    "ask messenger about rumours",
+    "ask messenger about news",
+    "ask messenger about jobs",
+    "exits",
+    "east",
+    "look",
+    "search",
+    "get all",
+    "look board",
+    "read board",
+    "look map",
+    "read map",
+    "help travel",
+    "rumours",
+    "news",
+    "updates all",
+    "weather",
+    "where",
+    "west",
+    "say Does anyone need assistance?",
+    "north",
+    "look",
+    "say I'm looking for adventure.",
+    "ask messenger about rumours",
+    "ask messenger about news",
+    "ask corsair about rumours",
+    "ask corsair about jobs",
+    "help movement",
+    "west",
+    "look",
+    "southwest",
+    "look",
+    "hint",
+)
+
+TriggerAction = Union[str, Callable[[], None], Callable[[re.Match[str]], None]]
+
+
+@dataclass
+class Trigger:
+    pattern: re.Pattern[str]
+    action: TriggerAction
+    once: bool
+    use_match: bool
+
+
+OutputHandler = Callable[[str, Optional[str]], None]
+
+
+def compose_output_handlers(*handlers: Optional[OutputHandler]) -> OutputHandler:
+    valid_handlers = [handler for handler in handlers if handler]
+
+    def _composed(text: str, meta: Optional[str]):
+        for handler in valid_handlers:
+            handler(text, meta)
+
+    return _composed
+
+
+class OllamaCommandController:
+    def __init__(
+        self,
+        client: "T2TMUDClient",
+        *,
+        host: str,
+        port: int,
+        model: str,
+        enabled: bool = True,
+        max_context_chars: int = 4000,
+    ):
+        self.client = client
+        self.host = host
+        self.port = port
+        self.model = model
+        self.enabled = enabled
+        self.max_context_chars = max_context_chars
+        self._history: Deque[str] = deque(maxlen=200)
+        self._command_history: Deque[str] = deque(maxlen=120)
+        self._help_topics: "OrderedDict[str, float]" = OrderedDict()
+        self._help_topic_limit = 40
+        self._last_exit_options: Tuple[str, ...] = ()
+        self._events: Deque[str] = deque(maxlen=120)
+        self._command_outcomes: Deque[str] = deque(maxlen=60)
+        self._last_error: str = ""
+        self._lock = threading.Lock()
+        self._http: Optional[urllib3.PoolManager] = None
+        self._pending_request = threading.Event()
+        self._stop_event = threading.Event()
+        self._cooldown_until = 0.0
+        self._worker: Optional[threading.Thread] = None
+        self._timeout = urllib3.Timeout(
+            connect=OLLAMA_CONNECT_TIMEOUT,
+            read=OLLAMA_READ_TIMEOUT,
+        )
+        self._retry = Retry(
+            total=OLLAMA_MAX_RETRIES,
+            connect=OLLAMA_MAX_RETRIES,
+            read=OLLAMA_MAX_RETRIES,
+            backoff_factor=1.5,
+            status_forcelist=(500, 502, 503, 504),
+            raise_on_status=False,
+            raise_on_redirect=False,
+        )
+        if self.enabled:
+            self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+            self._worker.start()
+
+    def shutdown(self):
+        if not self.enabled:
+            return
+        self._stop_event.set()
+        self._pending_request.set()
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=0.5)
+
+    def reset_context(self):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._history.clear()
+            self._command_history.clear()
+            self._help_topics.clear()
+            self._last_exit_options = ()
+            self._events.clear()
+            self._command_outcomes.clear()
+            self._last_error = ""
+
+    def handle_output(self, text: str, _meta: Optional[str]):
+        if not self.enabled:
+            return
+        cleaned = text.replace("\r", "")
+        if not cleaned.strip():
+            return
+        with self._lock:
+            self._history.append(cleaned)
+
+    def record_command(self, command: str):
+        if not self.enabled:
+            return
+        cleaned = command.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self._command_history.append(cleaned)
+            self._history.append(f">>> {cleaned}\n")
+
+    def record_event(self, event: str):
+        if not self.enabled:
+            return
+        cleaned = event.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self._events.append(cleaned)
+            self._history.append(f"[event] {cleaned}\n")
+
+    def record_command_outcome(self, command: str, outcome: str):
+        if not self.enabled:
+            return
+        outcome_text = outcome.strip()
+        if not outcome_text:
+            return
+        cleaned_command = command.strip()
+        if cleaned_command:
+            entry = f"{cleaned_command} -> {outcome_text}"
+        else:
+            entry = outcome_text
+        with self._lock:
+            self._command_outcomes.append(entry)
+            self._history.append(f"[outcome] {entry}\n")
+
+    def record_error(self, message: str):
+        if not self.enabled:
+            return
+        cleaned = message.strip()
+        with self._lock:
+            self._last_error = cleaned
+            if cleaned:
+                self._history.append(f"[error] {cleaned}\n")
+
+    def record_help_topic(self, topic: str):
+        if not self.enabled:
+            return
+        cleaned = topic.strip()
+        if not cleaned:
+            return
+        normalized = cleaned.lower()
+        with self._lock:
+            if normalized in self._help_topics:
+                self._help_topics.pop(normalized)
+            self._help_topics[normalized] = time.monotonic()
+            while len(self._help_topics) > self._help_topic_limit:
+                self._help_topics.popitem(last=False)
+            self._history.append(f"[help] {cleaned}\n")
+            self._events.append(f"Reviewing help topic '{cleaned}'")
+
+    def record_exit_options(self, exits: List[str]):
+        if not self.enabled:
+            return
+        normalized = tuple(option.strip().lower() for option in exits if option.strip())
+        if not normalized:
+            return
+        with self._lock:
+            if normalized == self._last_exit_options:
+                return
+            self._last_exit_options = normalized
+            pretty = ", ".join(normalized)
+            self._history.append(f"[exits] {pretty}\n")
+            self._events.append(f"Exits available: {pretty}")
+
+    def request_commands(self):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if now < self._cooldown_until:
+            return
+        self._pending_request.set()
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            self._pending_request.wait()
+            if self._stop_event.is_set():
+                break
+            self._pending_request.clear()
+            commands = self._generate_commands()
+            if commands:
+                self.client.queue_script(commands)
+                self.client.start_automation()
+                self._cooldown_until = time.monotonic() + 1.5
+            else:
+                self._cooldown_until = time.monotonic() + 3.0
+
+    def _generate_commands(self) -> List[str]:
+        (
+            context,
+            recent_commands,
+            help_topics,
+            exits,
+            outcomes,
+            events,
+            last_error,
+        ) = self._collect_context_bundle()
+        if not context:
+            return []
+        prompt = self._build_prompt(
+            context,
+            recent_commands,
+            help_topics,
+            exits,
+            outcomes,
+            events,
+            last_error,
+        )
+        response_text = self._query_ollama(prompt)
+        if not response_text:
+            return []
+        return self._extract_commands(response_text)
+
+    def _collect_context_bundle(
+        self,
+    ) -> Tuple[str, List[str], List[str], List[str], List[str], List[str], str]:
+        with self._lock:
+            if not self._history:
+                history = ""
+            else:
+                history = "".join(self._history)
+            commands = list(self._command_history)[-12:]
+            topics = [topic for topic, _ in list(self._help_topics.items())[-12:]]
+            exits = list(self._last_exit_options)
+            outcomes = list(self._command_outcomes)[-8:]
+            events = list(self._events)[-10:]
+            last_error = self._last_error
+        if len(history) > self.max_context_chars:
+            history = history[-self.max_context_chars :]
+        return history, commands, topics, exits, outcomes, events, last_error
+
+    def _build_prompt(
+        self,
+        context: str,
+        commands: List[str],
+        help_topics: List[str],
+        exits: List[str],
+        outcomes: List[str],
+        events: List[str],
+        last_error: str,
+    ) -> str:
+        guidance = (
+            "You are controlling a player character connected via telnet to The Two "
+            "Towers (t2tmud.org). Review the most recent game output delimited by "
+            "triple backticks and decide what to do next. Focus on exploring rooms, "
+            "reading descriptions, inspecting items, opening doors, asking NPCs "
+            "questions, finding quests, and preparing for combat when it is "
+            "sensible. When you respond, return JSON with a `commands` array of up "
+            "to three sequential MUD commands you wish to issue next. Optionally "
+            "include a `comment` field to briefly explain the plan. Do not include "
+            "any other text outside the JSON."
+        )
+        metadata_lines: List[str] = []
+        if commands:
+            metadata_lines.append(
+                "Recent commands executed: " + ", ".join(commands[-8:])
+            )
+        if help_topics:
+            metadata_lines.append(
+                "Help topics reviewed: " + ", ".join(help_topics[-10:])
+            )
+        if exits:
+            metadata_lines.append("Most recent exits seen: " + ", ".join(exits))
+        if outcomes:
+            metadata_lines.append(
+                "Recent command outcomes: " + "; ".join(outcomes[-6:])
+            )
+        if events:
+            metadata_lines.append("Recent observations: " + "; ".join(events[-6:]))
+        if last_error:
+            metadata_lines.append("Last Ollama error: " + last_error)
+        metadata = "\n".join(metadata_lines)
+        if metadata:
+            metadata = f"\nContext summary:\n{metadata}\n"
+        return f"{guidance}{metadata}\n\nRecent output:\n```\n{context}\n```\n\nRemember: respond with JSON only."
+
+    def _query_ollama(self, prompt: str) -> str:
+        try:
+            if self._http is None:
+                self._http = urllib3.PoolManager(
+                    timeout=self._timeout,
+                    retries=self._retry,
+                )
+            url = f"http://{self.host}:{self.port}/api/generate"
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+            }
+            encoded = json.dumps(payload).encode("utf-8")
+            response = self._http.request(
+                "POST",
+                url,
+                body=encoded,
+                headers={"Content-Type": "application/json"},
+            )
+        except MaxRetryError as exc:  # pragma: no cover - network failure logging
+            message = "retry limit reached contacting Ollama"
+            print(f"[ollama] request failed: {message} ({exc})", file=sys.stderr)
+            self.record_error(message)
+            return ""
+        except ReadTimeoutError as exc:  # pragma: no cover - network failure logging
+            message = "read timeout waiting for Ollama response"
+            print(f"[ollama] request failed: {message} ({exc})", file=sys.stderr)
+            self.record_error(message)
+            return ""
+        except HTTPError as exc:  # pragma: no cover - network failure logging
+            print(f"[ollama] HTTP error: {exc}", file=sys.stderr)
+            self.record_error(str(exc))
+            return ""
+        except Exception as exc:  # pragma: no cover - network failure logging
+            print(f"[ollama] request failed: {exc}", file=sys.stderr)
+            self.record_error(str(exc))
+            return ""
+
+        if response.status != 200:
+            print(f"[ollama] HTTP {response.status}", file=sys.stderr)
+            self.record_error(f"HTTP {response.status}")
+            return ""
+
+        try:
+            data = json.loads(response.data.decode("utf-8"))
+        except json.JSONDecodeError:
+            print("[ollama] invalid JSON response", file=sys.stderr)
+            self.record_error("invalid JSON response")
+            return ""
+        with self._lock:
+            self._last_error = ""
+        return data.get("response", "")
+
+    def _extract_commands(self, text: str) -> List[str]:
+        commands: List[str] = []
+        stripped = text.strip()
+        if not stripped:
+            return commands
+        parsed: Optional[dict] = None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+        if isinstance(parsed, dict):
+            raw_commands = parsed.get("commands")
+            if isinstance(raw_commands, list):
+                for entry in raw_commands:
+                    if isinstance(entry, str):
+                        cleaned = entry.strip()
+                        if cleaned:
+                            commands.append(cleaned)
+        if commands:
+            return commands[:3]
+
+        for line in stripped.splitlines():
+            cleaned = line.strip().strip("#").strip()
+            if not cleaned:
+                continue
+            commands.append(cleaned)
+            if len(commands) >= 3:
+                break
+        return commands
+
 
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', '69.142.141.135')
 OLLAMA_PORT = int(os.getenv('OLLAMA_PORT', '11434'))
@@ -591,7 +1155,7 @@ class T2TMUDClient:
                     time.sleep(0.05)
                     continue
 
-                data = raw.decode('ascii', errors='ignore')
+                data = raw.decode("ascii", errors="ignore")
                 if not data:
                     continue
 
@@ -599,16 +1163,16 @@ class T2TMUDClient:
                 if len(self._trigger_buffer) > 8192:
                     self._trigger_buffer = self._trigger_buffer[-4096:]
 
-                self.log.append(('server', data.replace('\r', '')))
+                self.log.append(("server", data.replace("\r", "")))
                 if self.output:
                     self.output(data, None)
                 self.check_triggers()
         except EOFError:
-            self.log.append(('error', 'Connection closed.'))
+            self.log.append(("error", "Connection closed."))
             if self.output:
                 self.output("Connection closed.\n", None)
         except OSError:
-            self.log.append(('error', 'Connection closed.'))
+            self.log.append(("error", "Connection closed."))
             if self.output:
                 self.output("Connection closed.\n", None)
         finally:
@@ -623,8 +1187,8 @@ class T2TMUDClient:
     def send(self, cmd):
         if not self.connection:
             return
-        self.connection.write(f"{cmd}\n".encode('ascii'))
-        self.log.append(('client', cmd.strip()))
+        self.connection.write(f"{cmd}\n".encode("ascii"))
+        self.log.append(("client", cmd.strip()))
         if self.ollama_controller:
             self.ollama_controller.record_command(cmd)
 
@@ -636,13 +1200,13 @@ class T2TMUDClient:
         try:
             self._closing = True
             if send_quit:
-                self.send('quit')
+                self.send("quit")
         finally:
             try:
                 self.connection.close()
             except OSError:
                 pass
-        self.log.append(('client', 'Connection closed.'))
+        self.log.append(("client", "Connection closed."))
         self.stop_automation()
         self.connection = None
         if self.ollama_controller:
@@ -701,7 +1265,9 @@ class T2TMUDClient:
         if self._automation_running.is_set() or not self.automation_commands:
             return
         self._automation_running.set()
-        self._automation_thread = threading.Thread(target=self._automation_loop, daemon=True)
+        self._automation_thread = threading.Thread(
+            target=self._automation_loop, daemon=True
+        )
         self._automation_thread.start()
 
     def stop_automation(self):
@@ -723,9 +1289,9 @@ class T2TMUDClient:
                 return None
             command = self.automation_commands[self._automation_cycle_index]
             if self.automation_commands:
-                self._automation_cycle_index = (
-                    self._automation_cycle_index + 1
-                ) % len(self.automation_commands)
+                self._automation_cycle_index = (self._automation_cycle_index + 1) % len(
+                    self.automation_commands
+                )
             return command
 
     def _automation_loop(self):
@@ -740,9 +1306,11 @@ class T2TMUDClient:
                 self.send(command)
             time.sleep(self.automation_delay)
 
+
 def print_out(text, _):
-    cleaned = text.replace('\r\n', '\n').replace('\r', '\n')
-    print(cleaned, end='')
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+    styled = colorize_output(cleaned)
+    print(styled, end="")
 
 
 def configure_client(
@@ -828,7 +1396,11 @@ def configure_client(
 
         def _last_client_command(self) -> str:
             for direction, message in reversed(client.log):
-                if direction == 'client' and message and not message.startswith('Connection'):
+                if (
+                    direction == "client"
+                    and message
+                    and not message.startswith("Connection")
+                ):
                     return message
             return ""
 
@@ -839,7 +1411,7 @@ def configure_client(
             self.ollama.record_command_outcome(last_cmd, summary)
 
         def greet(self, match: re.Match[str]):
-            speaker = match.group('speaker').strip()
+            speaker = match.group("speaker").strip()
             key = speaker.lower()
             now = time.monotonic()
             if now - self.last_greeting.get(key, 0.0) < 25.0:
@@ -848,7 +1420,7 @@ def configure_client(
             client.queue_script([f"say Greetings, {speaker}!"])
 
         def open_door(self, match: re.Match[str]):
-            direction = match.group('direction').lower()
+            direction = match.group("direction").lower()
             client.queue_script([f"open {direction} door", direction, "look"])
 
         def read_sign(self, _match: Optional[re.Match[str]] = None):
@@ -881,9 +1453,11 @@ def configure_client(
             client.queue_script(["ask messenger about rumours"])
 
         def inspect_item(self, match: re.Match[str]):
-            item = match.group('item').strip()
+            item = match.group("item").strip()
             normalized = re.sub(r"\s*\[[^\]]+\]\s*$", "", item).strip().lower()
-            if not normalized or any(keyword in normalized for keyword in ("door", "exit", "obvious")):
+            if not normalized or any(
+                keyword in normalized for keyword in ("door", "exit", "obvious")
+            ):
                 return
             if any(keyword in normalized for keyword in ENEMY_KEYWORDS):
                 return
@@ -901,14 +1475,17 @@ def configure_client(
             target = target_tokens[-1].lower() if target_tokens else normalized
 
             commands: List[str] = []
-            if 'sign' in normalized or 'map' in normalized:
+            if "sign" in normalized or "map" in normalized:
                 commands.extend(["look sign", "read sign", "map", "look map"])
             else:
                 commands.extend([f"look {target}", f"examine {target}"])
 
             for keyword, topics in TALKATIVE_NPC_KEYWORDS.items():
                 if keyword in normalized:
-                    if time.monotonic() - self.last_npc_interaction.get(keyword, 0.0) < 40.0:
+                    if (
+                        time.monotonic() - self.last_npc_interaction.get(keyword, 0.0)
+                        < 40.0
+                    ):
                         break
                     self.last_npc_interaction[keyword] = time.monotonic()
                     name_token = target
@@ -922,7 +1499,7 @@ def configure_client(
                 client.queue_script(commands)
 
         def consider_enemy(self, match: re.Match[str]):
-            creature = match.group('creature').strip()
+            creature = match.group("creature").strip()
             normalized = creature.lower()
             if not any(keyword in normalized for keyword in ENEMY_KEYWORDS):
                 return
@@ -942,7 +1519,7 @@ def configure_client(
             client.queue_script([f"help {topic}", "hint"])
 
         def handle_hint_line(self, match: re.Match[str]):
-            hint_text = match.group('hint').strip()
+            hint_text = match.group("hint").strip()
             if not hint_text:
                 return
             normalized = re.sub(r"\s+", " ", hint_text.lower())
@@ -991,7 +1568,7 @@ def configure_client(
                 self.ollama.record_event("Prompted to ask about a topic")
 
         def respond_to_help_me(self, match: re.Match[str]):
-            npc = match.group('npc').strip()
+            npc = match.group("npc").strip()
             now = time.monotonic()
             key = npc.lower()
             if now - self.last_helpful_prompt < 15.0 and self.last_hint_text:
@@ -1021,13 +1598,13 @@ def configure_client(
                 self.ollama.record_event("Reviewing message board")
 
         def handle_shop_direction(self, match: re.Match[str]):
-            direction = match.group('direction').lower()
+            direction = match.group("direction").lower()
             client.queue_script(self._commands_for_direction(direction))
             if self.ollama:
                 self.ollama.record_event(f"Shop hinted to the {direction}")
 
         def handle_help_suggestion(self, match: re.Match[str]):
-            topic = match.group('topic').strip().lower()
+            topic = match.group("topic").strip().lower()
             now = time.monotonic()
             if now - self.last_hint_follow_up < 20.0:
                 return
@@ -1042,7 +1619,7 @@ def configure_client(
                 self.ollama.record_event("Regained consciousness")
 
         def handle_travel_advice(self, match: re.Match[str]):
-            npc = match.group('npc').strip().lower()
+            npc = match.group("npc").strip().lower()
             topic = re.split(r"\s+", npc)[0]
             client.queue_script([f"help {topic}", f"where {topic}", "hint"])
             if self.ollama:
@@ -1097,7 +1674,7 @@ def configure_client(
         def handle_help_header(self, match: re.Match[str]):
             self.awaiting_more = True
             self.last_more_prompt = time.monotonic()
-            topic = match.group('topic').strip()
+            topic = match.group("topic").strip()
             if self.ollama and topic:
                 self.ollama.record_help_topic(topic)
                 self.ollama.record_event(f"Reading help header '{topic}'")
@@ -1107,7 +1684,7 @@ def configure_client(
                 self.ollama.request_commands()
 
         def handle_help_bullet(self, match: re.Match[str]):
-            topic = match.group('topic').strip()
+            topic = match.group("topic").strip()
             topic = re.sub(r"\s*-.*$", "", topic).strip()
             if not topic:
                 return
@@ -1118,7 +1695,9 @@ def configure_client(
             self.help_topics_seen[normalized] = now
             client.queue_script([f"help {topic.lower()}"])
             if self.ollama:
-                self.ollama.record_event(f"Queuing help topic '{topic.lower()}' from list")
+                self.ollama.record_event(
+                    f"Queuing help topic '{topic.lower()}' from list"
+                )
                 self.ollama.request_commands()
 
         def handle_more_prompt(self, match: Optional[re.Match[str]] = None):
@@ -1128,7 +1707,9 @@ def configure_client(
             self.last_more_prompt = now
             percent = None
             if match:
-                percent = match.groupdict().get('percent') if match.groupdict() else None
+                percent = (
+                    match.groupdict().get("percent") if match.groupdict() else None
+                )
             if percent and self.ollama:
                 self.ollama.record_event(f"Help pagination at {percent}%")
             elif self.ollama:
@@ -1196,8 +1777,8 @@ def configure_client(
                 self.ollama.record_event(f"Attempting exit '{direction}'")
 
         def handle_exits(self, match: re.Match[str]):
-            exits_text = match.group('exits')
-            cleaned = exits_text.replace(' and ', ', ')
+            exits_text = match.group("exits")
+            cleaned = exits_text.replace(" and ", ", ")
             options = [
                 option.strip().lower()
                 for option in re.split(r",|/", cleaned)
@@ -1221,10 +1802,12 @@ def configure_client(
             client.queue_script(self._commands_for_direction(direction))
 
         def handle_standard_exits(self, match: re.Match[str]):
-            block = match.group('block') or ''
+            block = match.group("block") or ""
             options = [
                 direction.strip().lower()
-                for direction in re.findall(r"^\s*([A-Za-z]+):", block, flags=re.IGNORECASE | re.MULTILINE)
+                for direction in re.findall(
+                    r"^\s*([A-Za-z]+):", block, flags=re.IGNORECASE | re.MULTILINE
+                )
             ]
             if not options:
                 return
@@ -1232,7 +1815,7 @@ def configure_client(
             self.last_exit_choice_index = 0
             if self.ollama:
                 self.ollama.record_exit_options(options)
-                self.ollama.record_event("Standard exits listed: " + ', '.join(options))
+                self.ollama.record_event("Standard exits listed: " + ", ".join(options))
                 self.ollama.request_commands()
             client.queue_script(self._commands_for_direction(options[0]))
 
@@ -1309,7 +1892,9 @@ def configure_client(
         client.add_trigger(prompt, handle_reconnect, flags=re.IGNORECASE | re.MULTILINE)
 
     client.add_trigger(LOGIN_SUCCESS_PATTERN, start_scenario, flags=re.IGNORECASE)
-    client.add_trigger(LOGIN_SUCCESS_PATTERN, world.handle_status_prompt, flags=re.IGNORECASE)
+    client.add_trigger(
+        LOGIN_SUCCESS_PATTERN, world.handle_status_prompt, flags=re.IGNORECASE
+    )
     client.add_trigger(
         r"Welcome to Arda,\s+%s!" % re.escape(profile.username),
         start_scenario,
@@ -1384,7 +1969,9 @@ def configure_client(
         flags=re.IGNORECASE,
         use_match=True,
     )
-    client.add_trigger(r"\bWhat\?\s*$", world.handle_unknown_command, flags=re.MULTILINE)
+    client.add_trigger(
+        r"\bWhat\?\s*$", world.handle_unknown_command, flags=re.MULTILINE
+    )
     client.add_trigger(
         r"You can't go that way!",
         world.handle_blocked_path,
@@ -1524,7 +2111,9 @@ class SessionManager:
     def _connect_current(self):
         profile = CHARACTER_PROFILES[self.profile_index]
         print(f"Connecting as {profile.username}...", flush=True)
-        client = create_configured_client(profile, on_disconnect=self._handle_disconnect)
+        client = create_configured_client(
+            profile, on_disconnect=self._handle_disconnect
+        )
         with self.lock:
             self.client = client
 
@@ -1629,5 +2218,6 @@ def main():
     else:
         print("Disconnected.")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
