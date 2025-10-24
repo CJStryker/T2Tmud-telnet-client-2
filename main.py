@@ -628,6 +628,490 @@ class OllamaCommandController:
         return commands
 
 
+OLLAMA_HOST = os.getenv('OLLAMA_HOST', '69.142.141.135')
+OLLAMA_PORT = int(os.getenv('OLLAMA_PORT', '11434'))
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:4b')
+OLLAMA_ENABLED = os.getenv('ENABLE_OLLAMA', '1').lower() not in {'0', 'false', 'no'}
+
+ENEMY_KEYWORDS = (
+    "slug",
+    "beetle",
+    "rat",
+    "wolf",
+    "brigand",
+    "bandit",
+    "thief",
+    "cutthroat",
+    "goblin",
+)
+
+TALKATIVE_NPC_KEYWORDS = {
+    "corsair": ("work", "rumours"),
+    "messenger": ("rumours", "news"),
+    "butler": ("overseer", "town"),
+    "trainer": ("training", "lessons"),
+    "ragakh": ("training", "camp"),
+    "driver": ("travel", "help"),
+}
+
+
+@dataclass
+class CharacterProfile:
+    username: str
+    password: str
+    intro_script: Tuple[str, ...] = ()
+    automation_commands: Optional[Tuple[str, ...]] = None
+
+
+CHARACTER_PROFILES: Tuple[CharacterProfile, ...] = (
+    CharacterProfile(
+        username="Marchos",
+        password="hello123",
+        intro_script=(
+            "who",
+            "where",
+            "weather",
+            "equipment",
+            "skills",
+            "quests",
+            "help newbie",
+            "help commands",
+            "help movement",
+            "rumours",
+            "look board",
+            "read board",
+            "updates all",
+            "hint",
+        ),
+    ),
+    CharacterProfile(
+        username="Zesty",
+        password="poopie",
+        intro_script=(
+            "who",
+            "where",
+            "equipment",
+            "skills",
+            "score",
+            "map",
+            "help hint",
+            "help combat",
+            "rumours",
+            "hint",
+        ),
+    ),
+)
+
+BASE_SCENARIO_SCRIPT: Tuple[str, ...] = (
+    "look",
+    "say Greetings, everyone!",
+    "hint",
+    "help",
+    "help newbie",
+    "help commands",
+    "help combat",
+    "help survival",
+    "help movement",
+    "help start",
+    "help help",
+    "help rules",
+    "help concepts",
+    "help theme",
+    "help list",
+    "help map",
+    "help hint",
+    "help guilds",
+    "help quests",
+    "help faq",
+    "faq",
+    "score",
+    "inventory",
+    "equipment",
+    "skills",
+    "hint",
+    "read sign",
+    "look sign",
+    "map",
+    "read map",
+    "ask messenger about rumours",
+    "ask messenger about news",
+    "ask messenger about jobs",
+    "exits",
+    "east",
+    "look",
+    "search",
+    "get all",
+    "look board",
+    "read board",
+    "look map",
+    "read map",
+    "help travel",
+    "rumours",
+    "news",
+    "updates all",
+    "weather",
+    "where",
+    "west",
+    "say Does anyone need assistance?",
+    "north",
+    "look",
+    "say I'm looking for adventure.",
+    "ask messenger about rumours",
+    "ask messenger about news",
+    "ask corsair about rumours",
+    "ask corsair about jobs",
+    "help movement",
+    "west",
+    "look",
+    "southwest",
+    "look",
+    "hint",
+)
+
+TriggerAction = Union[str, Callable[[], None], Callable[[re.Match[str]], None]]
+
+
+@dataclass
+class Trigger:
+    pattern: re.Pattern[str]
+    action: TriggerAction
+    once: bool
+    use_match: bool
+OutputHandler = Callable[[str, Optional[str]], None]
+
+
+def compose_output_handlers(*handlers: Optional[OutputHandler]) -> OutputHandler:
+    valid_handlers = [handler for handler in handlers if handler]
+
+    def _composed(text: str, meta: Optional[str]):
+        for handler in valid_handlers:
+            handler(text, meta)
+
+    return _composed
+
+
+class OllamaCommandController:
+    def __init__(
+        self,
+        client: 'T2TMUDClient',
+        *,
+        host: str,
+        port: int,
+        model: str,
+        enabled: bool = True,
+        max_context_chars: int = 4000,
+    ):
+        self.client = client
+        self.host = host
+        self.port = port
+        self.model = model
+        self.enabled = enabled
+        self.max_context_chars = max_context_chars
+        self._history: Deque[str] = deque(maxlen=200)
+        self._command_history: Deque[str] = deque(maxlen=120)
+        self._help_topics: "OrderedDict[str, float]" = OrderedDict()
+        self._help_topic_limit = 40
+        self._last_exit_options: Tuple[str, ...] = ()
+        self._events: Deque[str] = deque(maxlen=120)
+        self._command_outcomes: Deque[str] = deque(maxlen=60)
+        self._last_error: str = ""
+        self._lock = threading.Lock()
+        self._http: Optional[urllib3.PoolManager] = None
+        self._pending_request = threading.Event()
+        self._stop_event = threading.Event()
+        self._cooldown_until = 0.0
+        self._worker: Optional[threading.Thread] = None
+        if self.enabled:
+            self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+            self._worker.start()
+
+    def shutdown(self):
+        if not self.enabled:
+            return
+        self._stop_event.set()
+        self._pending_request.set()
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=0.5)
+
+    def reset_context(self):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._history.clear()
+            self._command_history.clear()
+            self._help_topics.clear()
+            self._last_exit_options = ()
+            self._events.clear()
+            self._command_outcomes.clear()
+            self._last_error = ""
+
+    def handle_output(self, text: str, _meta: Optional[str]):
+        if not self.enabled:
+            return
+        cleaned = text.replace('\r', '')
+        if not cleaned.strip():
+            return
+        with self._lock:
+            self._history.append(cleaned)
+
+    def record_command(self, command: str):
+        if not self.enabled:
+            return
+        cleaned = command.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self._command_history.append(cleaned)
+            self._history.append(f">>> {cleaned}\n")
+
+    def record_event(self, event: str):
+        if not self.enabled:
+            return
+        cleaned = event.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self._events.append(cleaned)
+            self._history.append(f"[event] {cleaned}\n")
+
+    def record_command_outcome(self, command: str, outcome: str):
+        if not self.enabled:
+            return
+        outcome_text = outcome.strip()
+        if not outcome_text:
+            return
+        cleaned_command = command.strip()
+        if cleaned_command:
+            entry = f"{cleaned_command} -> {outcome_text}"
+        else:
+            entry = outcome_text
+        with self._lock:
+            self._command_outcomes.append(entry)
+            self._history.append(f"[outcome] {entry}\n")
+
+    def record_error(self, message: str):
+        if not self.enabled:
+            return
+        cleaned = message.strip()
+        with self._lock:
+            self._last_error = cleaned
+            if cleaned:
+                self._history.append(f"[error] {cleaned}\n")
+
+    def record_help_topic(self, topic: str):
+        if not self.enabled:
+            return
+        cleaned = topic.strip()
+        if not cleaned:
+            return
+        normalized = cleaned.lower()
+        with self._lock:
+            if normalized in self._help_topics:
+                self._help_topics.pop(normalized)
+            self._help_topics[normalized] = time.monotonic()
+            while len(self._help_topics) > self._help_topic_limit:
+                self._help_topics.popitem(last=False)
+            self._history.append(f"[help] {cleaned}\n")
+            self._events.append(f"Reviewing help topic '{cleaned}'")
+
+    def record_exit_options(self, exits: List[str]):
+        if not self.enabled:
+            return
+        normalized = tuple(option.strip().lower() for option in exits if option.strip())
+        if not normalized:
+            return
+        with self._lock:
+            if normalized == self._last_exit_options:
+                return
+            self._last_exit_options = normalized
+            pretty = ', '.join(normalized)
+            self._history.append(f"[exits] {pretty}\n")
+            self._events.append(f"Exits available: {pretty}")
+
+    def request_commands(self):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if now < self._cooldown_until:
+            return
+        self._pending_request.set()
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            self._pending_request.wait()
+            if self._stop_event.is_set():
+                break
+            self._pending_request.clear()
+            commands = self._generate_commands()
+            if commands:
+                self.client.queue_script(commands)
+                self.client.start_automation()
+                self._cooldown_until = time.monotonic() + 1.5
+            else:
+                self._cooldown_until = time.monotonic() + 3.0
+
+    def _generate_commands(self) -> List[str]:
+        (
+            context,
+            recent_commands,
+            help_topics,
+            exits,
+            outcomes,
+            events,
+            last_error,
+        ) = self._collect_context_bundle()
+        if not context:
+            return []
+        prompt = self._build_prompt(
+            context,
+            recent_commands,
+            help_topics,
+            exits,
+            outcomes,
+            events,
+            last_error,
+        )
+        response_text = self._query_ollama(prompt)
+        if not response_text:
+            return []
+        return self._extract_commands(response_text)
+
+    def _collect_context_bundle(
+        self,
+    ) -> Tuple[str, List[str], List[str], List[str], List[str], List[str], str]:
+        with self._lock:
+            if not self._history:
+                history = ""
+            else:
+                history = ''.join(self._history)
+            commands = list(self._command_history)[-12:]
+            topics = [topic for topic, _ in list(self._help_topics.items())[-12:]]
+            exits = list(self._last_exit_options)
+            outcomes = list(self._command_outcomes)[-8:]
+            events = list(self._events)[-10:]
+            last_error = self._last_error
+        if len(history) > self.max_context_chars:
+            history = history[-self.max_context_chars :]
+        return history, commands, topics, exits, outcomes, events, last_error
+
+    def _build_prompt(
+        self,
+        context: str,
+        commands: List[str],
+        help_topics: List[str],
+        exits: List[str],
+        outcomes: List[str],
+        events: List[str],
+        last_error: str,
+    ) -> str:
+        guidance = (
+            "You are controlling a player character connected via telnet to The Two "
+            "Towers (t2tmud.org). Review the most recent game output delimited by "
+            "triple backticks and decide what to do next. Focus on exploring rooms, "
+            "reading descriptions, inspecting items, opening doors, asking NPCs "
+            "questions, finding quests, and preparing for combat when it is "
+            "sensible. When you respond, return JSON with a `commands` array of up "
+            "to three sequential MUD commands you wish to issue next. Optionally "
+            "include a `comment` field to briefly explain the plan. Do not include "
+            "any other text outside the JSON."
+        )
+        metadata_lines: List[str] = []
+        if commands:
+            metadata_lines.append(
+                "Recent commands executed: " + ', '.join(commands[-8:])
+            )
+        if help_topics:
+            metadata_lines.append(
+                "Help topics reviewed: " + ', '.join(help_topics[-10:])
+            )
+        if exits:
+            metadata_lines.append("Most recent exits seen: " + ', '.join(exits))
+        if outcomes:
+            metadata_lines.append(
+                "Recent command outcomes: " + '; '.join(outcomes[-6:])
+            )
+        if events:
+            metadata_lines.append(
+                "Recent observations: " + '; '.join(events[-6:])
+            )
+        if last_error:
+            metadata_lines.append("Last Ollama error: " + last_error)
+        metadata = "\n".join(metadata_lines)
+        if metadata:
+            metadata = f"\nContext summary:\n{metadata}\n"
+        return (
+            f"{guidance}{metadata}\n\nRecent output:\n```\n{context}\n```\n\nRemember: respond with JSON only."
+        )
+
+    def _query_ollama(self, prompt: str) -> str:
+        try:
+            if self._http is None:
+                self._http = urllib3.PoolManager()
+            url = f"http://{self.host}:{self.port}/api/generate"
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+            }
+            encoded = json.dumps(payload).encode('utf-8')
+            response = self._http.request(
+                'POST',
+                url,
+                body=encoded,
+                headers={'Content-Type': 'application/json'},
+                timeout=urllib3.Timeout(connect=2.0, read=20.0),
+            )
+        except Exception as exc:  # pragma: no cover - network failure logging
+            print(f"[ollama] request failed: {exc}", file=sys.stderr)
+            self.record_error(str(exc))
+            return ""
+
+        if response.status != 200:
+            print(f"[ollama] HTTP {response.status}", file=sys.stderr)
+            self.record_error(f"HTTP {response.status}")
+            return ""
+
+        try:
+            data = json.loads(response.data.decode('utf-8'))
+        except json.JSONDecodeError:
+            print("[ollama] invalid JSON response", file=sys.stderr)
+            self.record_error("invalid JSON response")
+            return ""
+        with self._lock:
+            self._last_error = ""
+        return data.get('response', '')
+
+    def _extract_commands(self, text: str) -> List[str]:
+        commands: List[str] = []
+        stripped = text.strip()
+        if not stripped:
+            return commands
+        parsed: Optional[dict] = None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+        if isinstance(parsed, dict):
+            raw_commands = parsed.get('commands')
+            if isinstance(raw_commands, list):
+                for entry in raw_commands:
+                    if isinstance(entry, str):
+                        cleaned = entry.strip()
+                        if cleaned:
+                            commands.append(cleaned)
+        if commands:
+            return commands[:3]
+
+        for line in stripped.splitlines():
+            cleaned = line.strip().strip('#').strip()
+            if not cleaned:
+                continue
+            commands.append(cleaned)
+            if len(commands) >= 3:
+                break
+        return commands
+
 class T2TMUDClient:
     def __init__(self, h, p, *, on_disconnect: Optional[Callable[[bool], None]] = None):
         self.host = h
