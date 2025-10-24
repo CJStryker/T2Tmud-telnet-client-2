@@ -1,3 +1,5 @@
+import json
+import os
 import sys
 import telnetlib
 import threading
@@ -6,6 +8,8 @@ import re
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Optional, Tuple, Union
+
+import urllib3
 
 DEFAULT_AUTOMATION_COMMANDS = (
     "look",
@@ -59,6 +63,11 @@ RECONNECT_PROMPTS = (
     r"^Connection established\.\s*$",
 )
 HOST, PORT = 't2tmud.org', 9999
+
+OLLAMA_HOST = os.getenv('OLLAMA_HOST', '69.142.141.135')
+OLLAMA_PORT = int(os.getenv('OLLAMA_PORT', '11434'))
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3')
+OLLAMA_ENABLED = os.getenv('ENABLE_OLLAMA', '1').lower() not in {'0', 'false', 'no'}
 
 ENEMY_KEYWORDS = (
     "slug",
@@ -207,6 +216,187 @@ class Trigger:
 OutputHandler = Callable[[str, Optional[str]], None]
 
 
+def compose_output_handlers(*handlers: Optional[OutputHandler]) -> OutputHandler:
+    valid_handlers = [handler for handler in handlers if handler]
+
+    def _composed(text: str, meta: Optional[str]):
+        for handler in valid_handlers:
+            handler(text, meta)
+
+    return _composed
+
+
+class OllamaCommandController:
+    def __init__(
+        self,
+        client: 'T2TMUDClient',
+        *,
+        host: str,
+        port: int,
+        model: str,
+        enabled: bool = True,
+        max_context_chars: int = 4000,
+    ):
+        self.client = client
+        self.host = host
+        self.port = port
+        self.model = model
+        self.enabled = enabled
+        self.max_context_chars = max_context_chars
+        self._history: Deque[str] = deque(maxlen=200)
+        self._lock = threading.Lock()
+        self._http: Optional[urllib3.PoolManager] = None
+        self._pending_request = threading.Event()
+        self._stop_event = threading.Event()
+        self._cooldown_until = 0.0
+        self._worker: Optional[threading.Thread] = None
+        if self.enabled:
+            self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+            self._worker.start()
+
+    def shutdown(self):
+        if not self.enabled:
+            return
+        self._stop_event.set()
+        self._pending_request.set()
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=0.5)
+
+    def reset_context(self):
+        if not self.enabled:
+            return
+        with self._lock:
+            self._history.clear()
+
+    def handle_output(self, text: str, _meta: Optional[str]):
+        if not self.enabled:
+            return
+        cleaned = text.replace('\r', '')
+        if not cleaned.strip():
+            return
+        with self._lock:
+            self._history.append(cleaned)
+
+    def request_commands(self):
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if now < self._cooldown_until:
+            return
+        self._pending_request.set()
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            self._pending_request.wait()
+            if self._stop_event.is_set():
+                break
+            self._pending_request.clear()
+            commands = self._generate_commands()
+            if commands:
+                self.client.queue_script(commands)
+                self.client.start_automation()
+                self._cooldown_until = time.monotonic() + 1.5
+
+    def _generate_commands(self) -> List[str]:
+        context = self._collect_context()
+        if not context:
+            return []
+        prompt = self._build_prompt(context)
+        response_text = self._query_ollama(prompt)
+        if not response_text:
+            return []
+        return self._extract_commands(response_text)
+
+    def _collect_context(self) -> str:
+        with self._lock:
+            if not self._history:
+                return ""
+            joined = ''.join(self._history)
+        if len(joined) > self.max_context_chars:
+            return joined[-self.max_context_chars :]
+        return joined
+
+    def _build_prompt(self, context: str) -> str:
+        guidance = (
+            "You are controlling a player character connected via telnet to The Two "
+            "Towers (t2tmud.org). Review the most recent game output delimited by "
+            "triple backticks and decide what to do next. Focus on exploring rooms, "
+            "reading descriptions, inspecting items, opening doors, asking NPCs "
+            "questions, finding quests, and preparing for combat when it is "
+            "sensible. When you respond, return JSON with a `commands` array of up "
+            "to three sequential MUD commands you wish to issue next. Optionally "
+            "include a `comment` field to briefly explain the plan. Do not include "
+            "any other text outside the JSON."
+        )
+        return f"{guidance}\n\nRecent output:\n```\n{context}\n```\n\nRemember: respond with JSON only."
+
+    def _query_ollama(self, prompt: str) -> str:
+        try:
+            if self._http is None:
+                self._http = urllib3.PoolManager()
+            url = f"http://{self.host}:{self.port}/api/generate"
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+            }
+            encoded = json.dumps(payload).encode('utf-8')
+            response = self._http.request(
+                'POST',
+                url,
+                body=encoded,
+                headers={'Content-Type': 'application/json'},
+                timeout=urllib3.Timeout(connect=2.0, read=20.0),
+            )
+        except Exception as exc:  # pragma: no cover
+            print(f"[ollama] request failed: {exc}", file=sys.stderr)
+            return ""
+
+        if response.status != 200:
+            print(f"[ollama] HTTP {response.status}", file=sys.stderr)
+            return ""
+
+        try:
+            data = json.loads(response.data.decode('utf-8'))
+        except json.JSONDecodeError:
+            print("[ollama] invalid JSON response", file=sys.stderr)
+            return ""
+
+        return data.get('response', '')
+
+    def _extract_commands(self, text: str) -> List[str]:
+        commands: List[str] = []
+        stripped = text.strip()
+        if not stripped:
+            return commands
+        parsed: Optional[dict] = None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+        if isinstance(parsed, dict):
+            raw_commands = parsed.get('commands')
+            if isinstance(raw_commands, list):
+                for entry in raw_commands:
+                    if isinstance(entry, str):
+                        cleaned = entry.strip()
+                        if cleaned:
+                            commands.append(cleaned)
+        if commands:
+            return commands[:3]
+
+        # Fallback: grab first 3 non-empty lines as commands
+        for line in stripped.splitlines():
+            cleaned = line.strip().strip('#').strip()
+            if not cleaned:
+                continue
+            commands.append(cleaned)
+            if len(commands) >= 3:
+                break
+        return commands
+
+
 class T2TMUDClient:
     def __init__(self, h, p, *, on_disconnect: Optional[Callable[[bool], None]] = None):
         self.host = h
@@ -227,6 +417,7 @@ class T2TMUDClient:
         self.on_disconnect = on_disconnect
         self._closing = False
         self._pause_condition: Optional[Callable[[], bool]] = None
+        self.ollama_controller: Optional[OllamaCommandController] = None
 
     def connect(self, output: OutputHandler):
         self.output = output
@@ -286,6 +477,8 @@ class T2TMUDClient:
 
     def close(self, send_quit: bool = True):
         if not self.connection:
+            if self.ollama_controller:
+                self.ollama_controller.shutdown()
             return
         try:
             self._closing = True
@@ -299,6 +492,8 @@ class T2TMUDClient:
         self.log.append(('client', 'Connection closed.'))
         self.stop_automation()
         self.connection = None
+        if self.ollama_controller:
+            self.ollama_controller.shutdown()
 
     def add_trigger(
         self,
@@ -398,9 +593,16 @@ def print_out(text, _):
     print(cleaned, end='')
 
 
-def configure_client(client, profile: CharacterProfile):
+def configure_client(
+    client,
+    profile: CharacterProfile,
+    ollama_controller: Optional[OllamaCommandController] = None,
+):
     client.profile = profile
     automation_commands = profile.automation_commands or DEFAULT_AUTOMATION_COMMANDS
+    # If using Ollama to drive commands, keep automation loop alive but empty commands (controller queues its own)
+    if ollama_controller and ollama_controller.enabled:
+        automation_commands = ("",)
     client.set_automation(automation_commands, AUTOMATION_DELAY_SECONDS)
 
     class LoginCoordinator:
@@ -434,6 +636,7 @@ def configure_client(client, profile: CharacterProfile):
     class WorldInteractor:
         def __init__(self):
             self.profile = profile
+            self.ollama = ollama_controller
             self._reset_state()
 
         def _reset_state(self):
@@ -469,6 +672,8 @@ def configure_client(client, profile: CharacterProfile):
 
         def reset_for_new_session(self):
             self._reset_state()
+            if self.ollama:
+                self.ollama.reset_context()
 
         def greet(self, match: re.Match[str]):
             speaker = match.group('speaker').strip()
@@ -490,7 +695,7 @@ def configure_client(client, profile: CharacterProfile):
             self.last_sign_seen = now
             client.queue_script(["read sign"])
 
-        def inspect_map(self, _match: Optional[re.Match[str]] = None):
+        def inspect_map(self, _match: Optional[re.Match] = None):
             now = time.monotonic()
             if now - self.last_map_check < 30.0:
                 return
@@ -544,7 +749,7 @@ def configure_client(client, profile: CharacterProfile):
                         break
                     self.last_npc_interaction[keyword] = time.monotonic()
                     name_token = target
-                    greeting_name = (target_tokens[0] if target_tokens else keyword)
+                    greeting_name = target_tokens[0] if target_tokens else keyword
                     commands.append(f"say Greetings, {greeting_name}!")
                     for topic in topics:
                         commands.append(f"ask {name_token} about {topic}")
@@ -598,6 +803,8 @@ def configure_client(client, profile: CharacterProfile):
             else:
                 commands.append("hint")
             client.queue_script(commands)
+            if self.ollama:
+                self.ollama.request_commands()
 
         def handle_unknown_command(self, _match: Optional[re.Match[str]] = None):
             self.unknown_command_count += 1
@@ -697,12 +904,16 @@ def configure_client(client, profile: CharacterProfile):
         def handle_status_prompt(self, _match: Optional[re.Match[str]] = None):
             self.awaiting_more = False
             self.schedule_quit_if_ready()
+            if self.ollama and not self.awaiting_more:
+                self.ollama.request_commands()
 
         def handle_help_header(self, match: re.Match[str]):
             self.awaiting_more = True
             self.last_more_prompt = time.monotonic()
             self.help_topics_read += 1
             self.schedule_quit_if_ready()
+            if self.ollama:
+                self.ollama.request_commands()
 
         def handle_help_bullet(self, match: re.Match[str]):
             topic = match.group('topic').strip()
@@ -715,6 +926,8 @@ def configure_client(client, profile: CharacterProfile):
                 return
             self.help_topics_seen[normalized] = now
             client.queue_script([f"help {topic.lower()}"])
+            if self.ollama:
+                self.ollama.request_commands()
 
         def handle_more_prompt(self, _match: Optional[re.Match[str]] = None):
             now = time.monotonic()
@@ -837,12 +1050,16 @@ def configure_client(client, profile: CharacterProfile):
             deduped.append(command)
         client.queue_script(deduped)
         client.start_automation()
+        if ollama_controller:
+            ollama_controller.request_commands()
 
     def handle_reconnect():
         scenario_state["started"] = False
         login.reset()
         world.reset_for_new_session()
         client.queue_script(["look", "exits", "hint"])
+        if ollama_controller:
+            ollama_controller.request_commands()
         client.start_automation()
 
     for prompt in USERNAME_PROMPTS:
@@ -1109,8 +1326,22 @@ def create_configured_client(
     profile: CharacterProfile, *, on_disconnect: Optional[Callable[[bool], None]] = None
 ):
     client = T2TMUDClient(HOST, PORT, on_disconnect=on_disconnect)
-    configure_client(client, profile)
-    client.connect(print_out)
+    ollama_controller: Optional[OllamaCommandController] = None
+    if OLLAMA_ENABLED:
+        ollama_controller = OllamaCommandController(
+            client,
+            host=OLLAMA_HOST,
+            port=OLLAMA_PORT,
+            model=OLLAMA_MODEL,
+            enabled=OLLAMA_ENABLED,
+        )
+        client.ollama_controller = ollama_controller
+    configure_client(client, profile, ollama_controller=ollama_controller)
+    output_handler = compose_output_handlers(
+        print_out,
+        ollama_controller.handle_output if ollama_controller else None,
+    )
+    client.connect(output_handler)
     return client
 
 
