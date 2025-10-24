@@ -13,19 +13,21 @@ DEFAULT_AUTOMATION_COMMANDS = (
     "west",
 )
 AUTOMATION_DELAY_SECONDS = 2.5
-LOGIN_SUCCESS_PATTERN = r"Welcome to The Two Towers"
+LOGIN_SUCCESS_PATTERN = r"HP:\s*\d+\s+EP:\s*\d+>"
 USERNAME_PROMPTS = (
     r"By what name do you wish to be known\??",
     r"Enter your character name:",
     r"Enter your name:",
+    r"Your name\??",
 )
 PASSWORD_PROMPTS = (
     r"What is your password\??",
     r"Password:",
     r"Enter your password:",
+    r"Your name\?.*Password:",
 )
-USERNAME = "Zesty"
-PASSWORD = "poopie"
+USERNAME = "Marchos"
+PASSWORD = "hello123"
 
 HOST, PORT = 't2tmud.org', 9999
 
@@ -150,10 +152,28 @@ def print_out(text, _):
 
 def configure_client(client):
     client.set_automation(DEFAULT_AUTOMATION_COMMANDS, AUTOMATION_DELAY_SECONDS)
+    sent_username = False
+    sent_password = False
+
+    def send_username():
+        nonlocal sent_username
+        if sent_username:
+            return
+        client.send(USERNAME)
+        sent_username = True
+
+    def send_password():
+        nonlocal sent_password
+        if sent_password:
+            return
+        client.send(PASSWORD)
+        sent_password = True
+
     for prompt in USERNAME_PROMPTS:
-        client.add_trigger(prompt, USERNAME, flags=re.IGNORECASE, once=True)
+        client.add_trigger(prompt, send_username, flags=re.IGNORECASE, once=True)
     for prompt in PASSWORD_PROMPTS:
-        client.add_trigger(prompt, PASSWORD, flags=re.IGNORECASE, once=True)
+        client.add_trigger(prompt, send_password, flags=re.IGNORECASE, once=True)
+
     client.add_trigger(LOGIN_SUCCESS_PATTERN, client.start_automation, flags=re.IGNORECASE, once=True)
 
 
