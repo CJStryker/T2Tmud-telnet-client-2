@@ -695,7 +695,7 @@ def configure_client(
             self.last_sign_seen = now
             client.queue_script(["read sign"])
 
-        def inspect_map(self, _match: Optional[re_match] := None):
+        def inspect_map(self, _match: Optional[re.Match] = None):
             now = time.monotonic()
             if now - self.last_map_check < 30.0:
                 return
