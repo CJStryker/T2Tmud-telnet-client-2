@@ -3,14 +3,22 @@ import telnetlib
 import threading
 import time
 import re
-from typing import Callable, List, Optional, Tuple, Union
+from collections import deque
+from dataclasses import dataclass
+from typing import Callable, Deque, Dict, List, Optional, Tuple, Union
 
 DEFAULT_AUTOMATION_COMMANDS = (
     "look",
     "north",
+    "look",
     "east",
+    "look",
     "south",
+    "look",
     "west",
+    "look",
+    "say Traveling onward.",
+    "search",
 )
 AUTOMATION_DELAY_SECONDS = 2.5
 LOGIN_SUCCESS_PATTERN = r"HP:\s*\d+\s+EP:\s*\d+>"
@@ -32,8 +40,27 @@ PASSWORD = "hello123"
 
 HOST, PORT = 't2tmud.org', 9999
 
-TriggerAction = Union[str, Callable[[], None]]
-Trigger = Tuple[re.Pattern[str], TriggerAction, bool]
+ENEMY_KEYWORDS = (
+    "slug",
+    "beetle",
+    "rat",
+    "wolf",
+    "brigand",
+    "bandit",
+    "thief",
+    "cutthroat",
+    "goblin",
+)
+
+TriggerAction = Union[str, Callable[[], None], Callable[[re.Match[str]], None]]
+
+@dataclass
+class Trigger:
+    pattern: re.Pattern[str]
+    action: TriggerAction
+    once: bool
+    use_match: bool
+
 OutputHandler = Callable[[str, Optional[str]], None]
 
 
@@ -50,6 +77,9 @@ class T2TMUDClient:
         self._automation_running = threading.Event()
         self._automation_thread = None
         self._trigger_buffer = ""
+        self._automation_script: Deque[str] = deque()
+        self._automation_cycle_index = 0
+        self._automation_lock = threading.Lock()
 
     def connect(self, output: OutputHandler):
         self.output = output
@@ -116,21 +146,34 @@ class T2TMUDClient:
         self.stop_automation()
         self.connection = None
 
-    def add_trigger(self, pattern: str, action: TriggerAction, *, flags: int = 0, once: bool = False):
+    def add_trigger(
+        self,
+        pattern: str,
+        action: TriggerAction,
+        *,
+        flags: int = 0,
+        once: bool = False,
+        use_match: bool = False,
+    ):
         compiled = re.compile(pattern, flags)
-        self.triggers.append((compiled, action, once))
+        self.triggers.append(Trigger(compiled, action, once, use_match))
 
     def check_triggers(self):
         indices_to_remove = []
         triggered = False
-        for idx, (pattern, action, once) in enumerate(self.triggers):
-            if pattern.search(self._trigger_buffer):
+        for idx, trigger in enumerate(self.triggers):
+            match = trigger.pattern.search(self._trigger_buffer)
+            if match:
+                action = trigger.action
                 if callable(action):
-                    action()
+                    if trigger.use_match:
+                        action(match)  # type: ignore[arg-type]
+                    else:
+                        action()  # type: ignore[call-arg]
                 else:
                     self.send(action)
                 triggered = True
-                if once:
+                if trigger.once:
                     indices_to_remove.append(idx)
         for idx in reversed(indices_to_remove):
             del self.triggers[idx]
@@ -138,8 +181,16 @@ class T2TMUDClient:
             self._trigger_buffer = ""
 
     def set_automation(self, commands, delay):
-        self.automation_commands = list(commands)
-        self.automation_delay = delay
+        with self._automation_lock:
+            self.automation_commands = list(commands)
+            self._automation_cycle_index = 0
+            self.automation_delay = delay
+
+    def queue_script(self, commands):
+        with self._automation_lock:
+            for command in commands:
+                if command:
+                    self._automation_script.append(command)
 
     def start_automation(self):
         if self._automation_running.is_set() or not self.automation_commands:
@@ -159,13 +210,28 @@ class T2TMUDClient:
         ):
             self._automation_thread.join(timeout=0.1)
 
+    def _next_automation_command(self) -> Optional[str]:
+        with self._automation_lock:
+            if self._automation_script:
+                return self._automation_script.popleft()
+            if not self.automation_commands:
+                return None
+            command = self.automation_commands[self._automation_cycle_index]
+            if self.automation_commands:
+                self._automation_cycle_index = (
+                    self._automation_cycle_index + 1
+                ) % len(self.automation_commands)
+            return command
+
     def _automation_loop(self):
         while self._automation_running.is_set():
-            for command in self.automation_commands:
-                if not self._automation_running.is_set():
-                    break
+            command = self._next_automation_command()
+            if not self._automation_running.is_set():
+                break
+            if command:
                 self.send(command)
-                time.sleep(self.automation_delay)
+            time.sleep(self.automation_delay)
+
 
 def print_out(text, _):
     cleaned = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -182,7 +248,7 @@ def configure_client(client):
 
         def _should_send(self, last_sent_at: float) -> bool:
             now = time.monotonic()
-            return (now - last_sent_at) >= 1.0
+            return now - last_sent_at >= 1.0
 
         def send_username(self):
             if not self._should_send(self.username_sent_at):
@@ -203,23 +269,150 @@ def configure_client(client):
             self.username_sent_at = 0.0
             self.password_sent_at = 0.0
 
-    login = LoginCoordinator()
+    class WorldInteractor:
+        def __init__(self):
+            self.last_greeting: Dict[str, float] = {}
+            self.last_sign_seen = 0.0
+            self.last_map_check = 0.0
+            self.last_messenger = 0.0
+            self.last_enemy: Dict[str, float] = {}
 
-    def handle_login_success():
+        def greet(self, match: re.Match[str]):
+            speaker = match.group('speaker').strip()
+            key = speaker.lower()
+            now = time.monotonic()
+            if now - self.last_greeting.get(key, 0.0) < 25.0:
+                return
+            self.last_greeting[key] = now
+            client.queue_script([f"say Greetings, {speaker}!"])
+
+        def open_door(self, match: re.Match[str]):
+            direction = match.group('direction').lower()
+            client.queue_script([f"open {direction} door", direction, "look"])
+
+        def read_sign(self, _match: Optional[re.Match[str]] = None):
+            now = time.monotonic()
+            if now - self.last_sign_seen < 20.0:
+                return
+            self.last_sign_seen = now
+            client.queue_script(["read sign"])
+
+        def inspect_map(self, _match: Optional[re.Match[str]] = None):
+            now = time.monotonic()
+            if now - self.last_map_check < 30.0:
+                return
+            self.last_map_check = now
+            client.queue_script(["look map", "read map"])
+
+        def ask_messenger(self, _match: Optional[re.Match[str]] = None):
+            now = time.monotonic()
+            if now - self.last_messenger < 45.0:
+                return
+            self.last_messenger = now
+            client.queue_script(["ask messenger rumours"])
+
+        def consider_enemy(self, match: re.Match[str]):
+            creature = match.group('creature').strip()
+            normalized = creature.lower()
+            if not any(keyword in normalized for keyword in ENEMY_KEYWORDS):
+                return
+            now = time.monotonic()
+            if now - self.last_enemy.get(normalized, 0.0) < 15.0:
+                return
+            self.last_enemy[normalized] = now
+            target = normalized.split()[-1]
+            target = target.replace("'", "")
+            client.queue_script([f"kill {target}"])
+
+    login = LoginCoordinator()
+    world = WorldInteractor()
+
+    scenario_state = {"started": False}
+
+    def start_scenario():
+        if scenario_state["started"]:
+            return
+        scenario_state["started"] = True
         login.reset()
+        client.queue_script(
+            [
+                "look",
+                "say Greetings, everyone!",
+                "read sign",
+                "ask messenger rumours",
+                "open east door",
+                "east",
+                "look",
+                "search",
+                "get all",
+                "west",
+                "say Does anyone need assistance?",
+                "north",
+                "look",
+                "say I'm looking for adventure.",
+                "west",
+                "look",
+                "southwest",
+                "look",
+            ]
+        )
         client.start_automation()
 
     for prompt in USERNAME_PROMPTS:
         client.add_trigger(prompt, login.send_username, flags=re.IGNORECASE)
     for prompt in PASSWORD_PROMPTS:
         client.add_trigger(prompt, login.send_password, flags=re.IGNORECASE)
-    client.add_trigger(LOGIN_SUCCESS_PATTERN, handle_login_success, flags=re.IGNORECASE)
-    client.add_trigger(r"Welcome to Arda,\s+%s!" % re.escape(USERNAME), handle_login_success, flags=re.IGNORECASE)
+
+    client.add_trigger(LOGIN_SUCCESS_PATTERN, start_scenario, flags=re.IGNORECASE)
+    client.add_trigger(
+        r"Welcome to Arda,\s+%s!" % re.escape(USERNAME),
+        start_scenario,
+        flags=re.IGNORECASE,
+    )
     client.add_trigger(
         r"Ragakh says in Westron: What is your name, young one\?",
         f"say {USERNAME}",
         flags=re.IGNORECASE,
         once=True,
+    )
+    client.add_trigger(
+        r"(?P<speaker>[A-Z][\w' -]+) says in Westron:",
+        world.greet,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"The (?P<direction>north|south|east|west|northeast|northwest|southeast|southwest) door is closed\.",
+        world.open_door,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"A sign with the map of Azrakadar",
+        world.inspect_map,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"(?m)^\s*A sign\b",
+        world.read_sign,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"A lean orc messenger",
+        world.ask_messenger,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"(?m)^\s*A (?P<creature>[^\[]+?)(?:\s*\[[0-9]+\])?\s*$",
+        world.consider_enemy,
+        flags=re.IGNORECASE | re.MULTILINE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"(?m)^\s*An (?P<creature>[^\[]+?)(?:\s*\[[0-9]+\])?\s*$",
+        world.consider_enemy,
+        flags=re.IGNORECASE | re.MULTILINE,
+        use_match=True,
     )
 
 
