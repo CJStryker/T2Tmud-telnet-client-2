@@ -197,13 +197,13 @@ BASE_SCENARIO_SCRIPT: Tuple[str, ...] = (
 
 TriggerAction = Union[str, Callable[[], None], Callable[[re.Match[str]], None]]
 
-
 @dataclass
 class Trigger:
     pattern: re.Pattern[str]
     action: TriggerAction
     once: bool
     use_match: bool
+
 OutputHandler = Callable[[str, Optional[str]], None]
 
 
@@ -392,6 +392,7 @@ class T2TMUDClient:
                 self.send(command)
             time.sleep(self.automation_delay)
 
+
 def print_out(text, _):
     cleaned = text.replace('\r\n', '\n').replace('\r', '\n')
     print(cleaned, end='')
@@ -543,7 +544,7 @@ def configure_client(client, profile: CharacterProfile):
                         break
                     self.last_npc_interaction[keyword] = time.monotonic()
                     name_token = target
-                    greeting_name = target_tokens[0] if target_tokens else keyword
+                    greeting_name = (target_tokens[0] if target_tokens else keyword)
                     commands.append(f"say Greetings, {greeting_name}!")
                     for topic in topics:
                         commands.append(f"ask {name_token} about {topic}")
@@ -1135,6 +1136,7 @@ def main():
         print("Disconnected.")
     else:
         print("Disconnected.")
+
 
 if __name__ == '__main__':
     main()
