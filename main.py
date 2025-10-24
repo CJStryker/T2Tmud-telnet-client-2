@@ -5,7 +5,7 @@ import telnetlib
 import threading
 import time
 import re
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Optional, Tuple, Union
 
@@ -206,13 +206,13 @@ BASE_SCENARIO_SCRIPT: Tuple[str, ...] = (
 
 TriggerAction = Union[str, Callable[[], None], Callable[[re.Match[str]], None]]
 
+
 @dataclass
 class Trigger:
     pattern: re.Pattern[str]
     action: TriggerAction
     once: bool
     use_match: bool
-
 OutputHandler = Callable[[str, Optional[str]], None]
 
 
@@ -244,6 +244,10 @@ class OllamaCommandController:
         self.enabled = enabled
         self.max_context_chars = max_context_chars
         self._history: Deque[str] = deque(maxlen=200)
+        self._command_history: Deque[str] = deque(maxlen=120)
+        self._help_topics: "OrderedDict[str, float]" = OrderedDict()
+        self._help_topic_limit = 40
+        self._last_exit_options: Tuple[str, ...] = ()
         self._lock = threading.Lock()
         self._http: Optional[urllib3.PoolManager] = None
         self._pending_request = threading.Event()
@@ -267,6 +271,9 @@ class OllamaCommandController:
             return
         with self._lock:
             self._history.clear()
+            self._command_history.clear()
+            self._help_topics.clear()
+            self._last_exit_options = ()
 
     def handle_output(self, text: str, _meta: Optional[str]):
         if not self.enabled:
@@ -276,6 +283,44 @@ class OllamaCommandController:
             return
         with self._lock:
             self._history.append(cleaned)
+
+    def record_command(self, command: str):
+        if not self.enabled:
+            return
+        cleaned = command.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self._command_history.append(cleaned)
+            self._history.append(f">>> {cleaned}\n")
+
+    def record_help_topic(self, topic: str):
+        if not self.enabled:
+            return
+        cleaned = topic.strip()
+        if not cleaned:
+            return
+        normalized = cleaned.lower()
+        with self._lock:
+            if normalized in self._help_topics:
+                self._help_topics.pop(normalized)
+            self._help_topics[normalized] = time.monotonic()
+            while len(self._help_topics) > self._help_topic_limit:
+                self._help_topics.popitem(last=False)
+            self._history.append(f"[help] {cleaned}\n")
+
+    def record_exit_options(self, exits: List[str]):
+        if not self.enabled:
+            return
+        normalized = tuple(option.strip().lower() for option in exits if option.strip())
+        if not normalized:
+            return
+        with self._lock:
+            if normalized == self._last_exit_options:
+                return
+            self._last_exit_options = normalized
+            pretty = ', '.join(normalized)
+            self._history.append(f"[exits] {pretty}\n")
 
     def request_commands(self):
         if not self.enabled:
@@ -298,25 +343,35 @@ class OllamaCommandController:
                 self._cooldown_until = time.monotonic() + 1.5
 
     def _generate_commands(self) -> List[str]:
-        context = self._collect_context()
+        context, recent_commands, help_topics, exits = self._collect_context_bundle()
         if not context:
             return []
-        prompt = self._build_prompt(context)
+        prompt = self._build_prompt(context, recent_commands, help_topics, exits)
         response_text = self._query_ollama(prompt)
         if not response_text:
             return []
         return self._extract_commands(response_text)
 
-    def _collect_context(self) -> str:
+    def _collect_context_bundle(self) -> Tuple[str, List[str], List[str], List[str]]:
         with self._lock:
             if not self._history:
-                return ""
-            joined = ''.join(self._history)
-        if len(joined) > self.max_context_chars:
-            return joined[-self.max_context_chars :]
-        return joined
+                history = ""
+            else:
+                history = ''.join(self._history)
+            commands = list(self._command_history)[-12:]
+            topics = [topic for topic, _ in list(self._help_topics.items())[-12:]]
+            exits = list(self._last_exit_options)
+        if len(history) > self.max_context_chars:
+            history = history[-self.max_context_chars :]
+        return history, commands, topics, exits
 
-    def _build_prompt(self, context: str) -> str:
+    def _build_prompt(
+        self,
+        context: str,
+        commands: List[str],
+        help_topics: List[str],
+        exits: List[str],
+    ) -> str:
         guidance = (
             "You are controlling a player character connected via telnet to The Two "
             "Towers (t2tmud.org). Review the most recent game output delimited by "
@@ -328,7 +383,23 @@ class OllamaCommandController:
             "include a `comment` field to briefly explain the plan. Do not include "
             "any other text outside the JSON."
         )
-        return f"{guidance}\n\nRecent output:\n```\n{context}\n```\n\nRemember: respond with JSON only."
+        metadata_lines: List[str] = []
+        if commands:
+            metadata_lines.append(
+                "Recent commands executed: " + ', '.join(commands[-8:])
+            )
+        if help_topics:
+            metadata_lines.append(
+                "Help topics reviewed: " + ', '.join(help_topics[-10:])
+            )
+        if exits:
+            metadata_lines.append("Most recent exits seen: " + ', '.join(exits))
+        metadata = "\n".join(metadata_lines)
+        if metadata:
+            metadata = f"\nContext summary:\n{metadata}\n"
+        return (
+            f"{guidance}{metadata}\n\nRecent output:\n```\n{context}\n```\n\nRemember: respond with JSON only."
+        )
 
     def _query_ollama(self, prompt: str) -> str:
         try:
@@ -348,7 +419,7 @@ class OllamaCommandController:
                 headers={'Content-Type': 'application/json'},
                 timeout=urllib3.Timeout(connect=2.0, read=20.0),
             )
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:  # pragma: no cover - network failure logging
             print(f"[ollama] request failed: {exc}", file=sys.stderr)
             return ""
 
@@ -386,7 +457,6 @@ class OllamaCommandController:
         if commands:
             return commands[:3]
 
-        # Fallback: grab first 3 non-empty lines as commands
         for line in stripped.splitlines():
             cleaned = line.strip().strip('#').strip()
             if not cleaned:
@@ -395,7 +465,6 @@ class OllamaCommandController:
             if len(commands) >= 3:
                 break
         return commands
-
 
 class T2TMUDClient:
     def __init__(self, h, p, *, on_disconnect: Optional[Callable[[bool], None]] = None):
@@ -474,6 +543,8 @@ class T2TMUDClient:
             return
         self.connection.write(f"{cmd}\n".encode('ascii'))
         self.log.append(('client', cmd.strip()))
+        if self.ollama_controller:
+            self.ollama_controller.record_command(cmd)
 
     def close(self, send_quit: bool = True):
         if not self.connection:
@@ -587,7 +658,6 @@ class T2TMUDClient:
                 self.send(command)
             time.sleep(self.automation_delay)
 
-
 def print_out(text, _):
     cleaned = text.replace('\r\n', '\n').replace('\r', '\n')
     print(cleaned, end='')
@@ -600,7 +670,6 @@ def configure_client(
 ):
     client.profile = profile
     automation_commands = profile.automation_commands or DEFAULT_AUTOMATION_COMMANDS
-    # If using Ollama to drive commands, keep automation loop alive but empty commands (controller queues its own)
     if ollama_controller and ollama_controller.enabled:
         automation_commands = ("",)
     client.set_automation(automation_commands, AUTOMATION_DELAY_SECONDS)
@@ -695,7 +764,7 @@ def configure_client(
             self.last_sign_seen = now
             client.queue_script(["read sign"])
 
-        def inspect_map(self, _match: Optional[re.Match] = None):
+        def inspect_map(self, _match: Optional[re.Match[str]] = None):
             now = time.monotonic()
             if now - self.last_map_check < 30.0:
                 return
@@ -910,6 +979,9 @@ def configure_client(
         def handle_help_header(self, match: re.Match[str]):
             self.awaiting_more = True
             self.last_more_prompt = time.monotonic()
+            topic = match.group('topic').strip()
+            if self.ollama and topic:
+                self.ollama.record_help_topic(topic)
             self.help_topics_read += 1
             self.schedule_quit_if_ready()
             if self.ollama:
@@ -1011,6 +1083,9 @@ def configure_client(
             self.last_exit_options = normalized_options
             self.last_exit_choice_index = next_index
             direction = options[next_index]
+            if self.ollama:
+                self.ollama.record_exit_options(list(normalized_options))
+                self.ollama.request_commands()
             client.queue_script(self._commands_for_direction(direction))
 
         def _commands_for_direction(self, direction: str) -> List[str]:
@@ -1367,7 +1442,6 @@ def main():
         print("Disconnected.")
     else:
         print("Disconnected.")
-
 
 if __name__ == '__main__':
     main()
