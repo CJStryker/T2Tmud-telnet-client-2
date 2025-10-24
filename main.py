@@ -47,6 +47,10 @@ PROMPT_PATTERN = re.compile(r"HP:\s*\d+\s+EP:\s*\d+>")
 HINT_PATTERN = re.compile(r"^\*\*\* HINT \*\*\*")
 HELP_HEADER_PATTERN = re.compile(r"^Help for ")
 MORE_PATTERN = re.compile(r"--More--")
+TRAVELTO_START_PATTERN = re.compile(r"Travelto:\s+Journey begun", re.IGNORECASE)
+TRAVELTO_ABORT_PATTERN = re.compile(r"Travelto:\s+aborted", re.IGNORECASE)
+TRAVELTO_RESUME_PATTERN = re.compile(r"Travelto:\s+resuming journey", re.IGNORECASE)
+TRAVELTO_COMPLETE_PATTERN = re.compile(r"Travelto:\s+(?:Journey complete|arrived)", re.IGNORECASE)
 
 
 class TerminalDisplay:
@@ -158,8 +162,10 @@ class GameKnowledge:
         "legendinfo",
         "map",
         "travelto <destination>",
+        "travelto resume",
         "exits",
         "search",
+        "rest",
     )
 
     MOVEMENT_COMMANDS: Sequence[str] = (
@@ -185,6 +191,9 @@ class GameKnowledge:
         "say <message>",
         "ask <npc> about <topic>",
         "read <object>",
+        "read board",
+        "read board all",
+        "look board",
         "look <object>",
         "examine <object>",
         "get <item>",
@@ -194,8 +203,12 @@ class GameKnowledge:
         "wield <item>",
         "give <item> to <npc>",
         "give <amount> gold to <npc>",
+        "ask <npc> about work",
+        "ask <npc> about rumours",
+        "ask <npc> about travel",
         "buy <item>",
         "sell <item>",
+        "order <item>",
         "hint",
         "help <topic>",
     )
@@ -214,12 +227,26 @@ class GameKnowledge:
         "Use 'hint' whenever progress seems unclear or a help prompt appears.",
         "Read message boards, signs, and help topics to gather objectives.",
         "Interact with NPCs using 'say' and 'ask <npc> about <topic>'.",
+        "Follow signposts with 'travelto <destination>' and let the journey finish before issuing other commands; resume with 'travelto resume' if paused.",
+        "Seek supplies in taverns: 'order <item>', 'rent room', and 'rest' recover resources faster when others are nearby.",
+        "Share or collect gold thoughtfully using 'give <amount> gold to <npc>' or by exploring for valuables before renting rooms.",
         "When help topics suggest more reading, queue follow-up 'help <topic>' calls.",
         "When '--More--' pagination appears, send a blank command to continue.",
         "Avoid repeating the same command rapidly if the game says you cannot do it.",
         "Do not log out or switch characters unless explicitly asked.",
         "Only send in-game commands; never respond with narrative text.",
-        "Use 'travelto <destination>' at signposts to reach other towns quickly.",
+    )
+
+    SUPPORT_COMMANDS: Sequence[str] = (
+        "rent room",
+        "order <item>",
+        "bribe <npc>",
+        "comm on",
+        "rest",
+        "deposit <amount>",
+        "withdraw <amount>",
+        "give <amount> gold to <npc>",
+        "travelto resume",
     )
 
     @classmethod
@@ -231,6 +258,7 @@ class GameKnowledge:
             fmt_section("Core exploration", cls.CORE_COMMANDS),
             fmt_section("Movement", cls.MOVEMENT_COMMANDS),
             fmt_section("Interaction", cls.INTERACTION_COMMANDS),
+            fmt_section("Support", cls.SUPPORT_COMMANDS),
             fmt_section("Combat", cls.COMBAT_COMMANDS),
             "Guidelines: " + " ".join(cls.STRATEGY_GUIDELINES),
         ]
@@ -558,6 +586,7 @@ class TelnetSession:
         self._logged_in = False
         self._username_sent = False
         self._password_sent = False
+        self._travel_active = False
 
     def attach_planner(self, planner: OllamaPlanner):
         self._planner = planner
@@ -568,6 +597,7 @@ class TelnetSession:
         self._logged_in = False
         self._username_sent = False
         self._password_sent = False
+        self._travel_active = False
         self._stop_event.clear()
         try:
             self.connection = telnetlib.Telnet(HOST, PORT)
@@ -593,6 +623,7 @@ class TelnetSession:
         if self._planner:
             self._planner.deactivate()
         self.display.emit("event", "Connection closed")
+        self._travel_active = False
 
     def send_command(self, command: str, *, source: str):
         if not self.connection:
@@ -663,7 +694,33 @@ class TelnetSession:
                     self._password_sent = True
                     self._consume(pattern)
                     return
+        if TRAVELTO_START_PATTERN.search(self._buffer):
+            self._travel_active = True
+            self.display.emit("event", "Travelto route engaged; awaiting arrival")
+            if self._planner:
+                self._planner.note_event("Travelto auto-travel engaged")
+            self._consume(TRAVELTO_START_PATTERN)
+            return
+        if TRAVELTO_RESUME_PATTERN.search(self._buffer):
+            self._travel_active = True
+            self.display.emit("event", "Travelto route resumed")
+            if self._planner:
+                self._planner.note_event("Travelto route resumed")
+            self._consume(TRAVELTO_RESUME_PATTERN)
+            return
+        if TRAVELTO_ABORT_PATTERN.search(self._buffer) or TRAVELTO_COMPLETE_PATTERN.search(self._buffer):
+            self._travel_active = False
+            self.display.emit("event", "Travelto route ended")
+            if self._planner:
+                self._planner.note_event("Travelto route ended")
+                self._planner.request_commands("travelto ended")
+            self._buffer = TRAVELTO_ABORT_PATTERN.sub("", self._buffer)
+            self._buffer = TRAVELTO_COMPLETE_PATTERN.sub("", self._buffer)
+            return
         if PROMPT_PATTERN.search(self._buffer):
+            if self._travel_active:
+                self._consume(PROMPT_PATTERN)
+                return
             if not self._logged_in:
                 self._logged_in = True
                 self.display.emit("event", "Login successful; interactive prompt ready")
@@ -728,6 +785,38 @@ class ConsoleInputThread(threading.Thread):
 # Application bootstrap
 ###############################################################################
 
+###############################################################################
+# Application bootstrap
+###############################################################################
+
+
+def run_client():
+    display = TerminalDisplay()
+    knowledge_text = GameKnowledge.build_reference()
+    session = TelnetSession(display)
+    planner = OllamaPlanner(
+        send_callback=lambda cmd: session.send_command(cmd, source="ollama"),
+        knowledge_text=knowledge_text,
+        enabled=OLLAMA_ENABLED,
+    )
+    session.attach_planner(planner)
+
+    profile = DEFAULT_PROFILES[0]
+    try:
+        session.connect(profile)
+    except RuntimeError as exc:
+        display.emit("error", str(exc))
+        planner.shutdown()
+        return
+
+    display.emit("event", "Type commands directly; use :exit to close locally.")
+    if OLLAMA_ENABLED:
+        display.emit("event", "Ollama automation is active and will respond after prompts.")
+    else:
+        display.emit("event", "Ollama automation is disabled via configuration.")
+
+    input_thread = ConsoleInputThread(session)
+    input_thread.start()
 
 def run_client():
     display = TerminalDisplay()
