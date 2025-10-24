@@ -20,7 +20,7 @@ PORT = int(os.getenv("T2T_PORT", "9999"))
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "69.142.141.135")
 OLLAMA_PORT = int(os.getenv("OLLAMA_PORT", "11434"))
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b-cloud")
 OLLAMA_ENABLED = os.getenv("ENABLE_OLLAMA", "1").lower() not in {"0", "false", "no"}
 OLLAMA_CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "5.0"))
 OLLAMA_READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "90.0"))
@@ -157,6 +157,7 @@ class GameKnowledge:
         "charinfo",
         "legendinfo",
         "map",
+        "travelto <destination>",
         "exits",
         "search",
     )
@@ -177,6 +178,7 @@ class GameKnowledge:
         "go <direction>",
         "open <direction> door",
         "climb <object>",
+        "travelto <destination>",
     )
 
     INTERACTION_COMMANDS: Sequence[str] = (
@@ -186,10 +188,12 @@ class GameKnowledge:
         "look <object>",
         "examine <object>",
         "get <item>",
+        "get <item> from <container>",
         "drop <item>",
         "wear <item>",
         "wield <item>",
         "give <item> to <npc>",
+        "give <amount> gold to <npc>",
         "buy <item>",
         "sell <item>",
         "hint",
@@ -215,6 +219,7 @@ class GameKnowledge:
         "Avoid repeating the same command rapidly if the game says you cannot do it.",
         "Do not log out or switch characters unless explicitly asked.",
         "Only send in-game commands; never respond with narrative text.",
+        "Use 'travelto <destination>' at signposts to reach other towns quickly.",
     )
 
     @classmethod
