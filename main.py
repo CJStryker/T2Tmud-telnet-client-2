@@ -9,16 +9,23 @@ from typing import Callable, Deque, Dict, List, Optional, Tuple, Union
 
 DEFAULT_AUTOMATION_COMMANDS = (
     "look",
-    "north",
-    "look",
-    "east",
-    "look",
-    "south",
-    "look",
-    "west",
-    "look",
-    "say Traveling onward.",
+    "inventory",
+    "score",
+    "equipment",
+    "skills",
+    "who",
+    "where",
+    "weather",
+    "time",
+    "news",
+    "updates all",
+    "exits",
+    "map",
     "search",
+    "hint",
+    "help commands",
+    "help movement",
+    "help combat",
 )
 AUTOMATION_DELAY_SECONDS = 2.5
 LOGIN_SUCCESS_PATTERN = r"HP:\s*\d+\s+EP:\s*\d+>"
@@ -35,9 +42,11 @@ PASSWORD_PROMPTS = (
     r"Enter your password:",
     r"Your name\?.*Password:",
 )
-USERNAME = "Marchos"
-PASSWORD = "hello123"
-
+RECONNECT_PROMPTS = (
+    r"^Reconnected\.\s*$",
+    r"^Connection restored\.\s*$",
+    r"^Connection established\.\s*$",
+)
 HOST, PORT = 't2tmud.org', 9999
 
 ENEMY_KEYWORDS = (
@@ -50,6 +59,121 @@ ENEMY_KEYWORDS = (
     "thief",
     "cutthroat",
     "goblin",
+)
+
+TALKATIVE_NPC_KEYWORDS = {
+    "corsair": ("work", "rumours"),
+    "messenger": ("rumours", "news"),
+    "butler": ("overseer", "town"),
+    "trainer": ("training", "lessons"),
+    "ragakh": ("training", "camp"),
+    "driver": ("travel", "help"),
+}
+
+
+@dataclass
+class CharacterProfile:
+    username: str
+    password: str
+    intro_script: Tuple[str, ...] = ()
+    automation_commands: Optional[Tuple[str, ...]] = None
+
+
+CHARACTER_PROFILES: Tuple[CharacterProfile, ...] = (
+    CharacterProfile(
+        username="Marchos",
+        password="hello123",
+        intro_script=(
+            "who",
+            "where",
+            "weather",
+            "equipment",
+            "skills",
+            "quests",
+            "help newbie",
+            "help commands",
+            "help movement",
+            "rumours",
+            "look board",
+            "read board",
+            "updates all",
+            "hint",
+        ),
+    ),
+    CharacterProfile(
+        username="Zesty",
+        password="poopie",
+        intro_script=(
+            "who",
+            "where",
+            "equipment",
+            "skills",
+            "score",
+            "map",
+            "help hint",
+            "help combat",
+            "rumours",
+            "hint",
+        ),
+    ),
+)
+
+BASE_SCENARIO_SCRIPT: Tuple[str, ...] = (
+    "look",
+    "say Greetings, everyone!",
+    "hint",
+    "help",
+    "help newbie",
+    "help commands",
+    "help combat",
+    "help survival",
+    "help movement",
+    "help map",
+    "help hint",
+    "help guilds",
+    "help quests",
+    "score",
+    "inventory",
+    "equipment",
+    "skills",
+    "hint",
+    "read sign",
+    "look sign",
+    "map",
+    "read map",
+    "ask messenger about rumours",
+    "ask messenger about news",
+    "ask messenger about jobs",
+    "exits",
+    "east",
+    "look",
+    "search",
+    "get all",
+    "look board",
+    "read board",
+    "look map",
+    "read map",
+    "help travel",
+    "rumours",
+    "news",
+    "updates all",
+    "weather",
+    "where",
+    "west",
+    "say Does anyone need assistance?",
+    "north",
+    "look",
+    "say I'm looking for adventure.",
+    "ask messenger about rumours",
+    "ask messenger about news",
+    "ask corsair about rumours",
+    "ask corsair about jobs",
+    "help movement",
+    "west",
+    "look",
+    "southwest",
+    "look",
+    "hint",
 )
 
 TriggerAction = Union[str, Callable[[], None], Callable[[re.Match[str]], None]]
@@ -80,6 +204,7 @@ class T2TMUDClient:
         self._automation_script: Deque[str] = deque()
         self._automation_cycle_index = 0
         self._automation_lock = threading.Lock()
+        self.profile: Optional[CharacterProfile] = None
 
     def connect(self, output: OutputHandler):
         self.output = output
@@ -238,8 +363,10 @@ def print_out(text, _):
     print(cleaned, end='')
 
 
-def configure_client(client):
-    client.set_automation(DEFAULT_AUTOMATION_COMMANDS, AUTOMATION_DELAY_SECONDS)
+def configure_client(client, profile: CharacterProfile):
+    client.profile = profile
+    automation_commands = profile.automation_commands or DEFAULT_AUTOMATION_COMMANDS
+    client.set_automation(automation_commands, AUTOMATION_DELAY_SECONDS)
 
     class LoginCoordinator:
         def __init__(self):
@@ -254,15 +381,15 @@ def configure_client(client):
             if not self._should_send(self.username_sent_at):
                 return
             self.username_sent_at = time.monotonic()
-            client.send(USERNAME)
+            client.send(profile.username)
 
         def send_password(self):
             if not self._should_send(self.password_sent_at):
                 return
             if self.username_sent_at == 0.0:
                 self.username_sent_at = time.monotonic()
-                client.send(USERNAME)
-            client.send(PASSWORD)
+                client.send(profile.username)
+            client.send(profile.password)
             self.password_sent_at = time.monotonic()
 
         def reset(self):
@@ -276,6 +403,21 @@ def configure_client(client):
             self.last_map_check = 0.0
             self.last_messenger = 0.0
             self.last_enemy: Dict[str, float] = {}
+            self.last_exit_options: Tuple[str, ...] = ()
+            self.last_exit_choice_index = -1
+            self.blocked_attempts = 0
+            self.unknown_command_count = 0
+            self.last_help_request = 0.0
+            self.last_item_inspect: Dict[str, float] = {}
+            self.last_npc_interaction: Dict[str, float] = {}
+            self.last_board_check = 0.0
+            self.last_hint_follow_up = 0.0
+            self.last_hint_text = ""
+            self.last_hint_seen = 0.0
+            self.last_search_fail = 0.0
+            self.last_empty_take = 0.0
+            self.last_helpful_prompt = 0.0
+            self.profile = profile
 
         def greet(self, match: re.Match[str]):
             speaker = match.group('speaker').strip()
@@ -302,14 +444,63 @@ def configure_client(client):
             if now - self.last_map_check < 30.0:
                 return
             self.last_map_check = now
-            client.queue_script(["look map", "read map"])
+            client.queue_script(
+                [
+                    "look sign",
+                    "read sign",
+                    "map",
+                    "look map",
+                    "read map",
+                ]
+            )
 
         def ask_messenger(self, _match: Optional[re.Match[str]] = None):
             now = time.monotonic()
             if now - self.last_messenger < 45.0:
                 return
             self.last_messenger = now
-            client.queue_script(["ask messenger rumours"])
+            client.queue_script(["ask messenger about rumours"])
+
+        def inspect_item(self, match: re.Match[str]):
+            item = match.group('item').strip()
+            normalized = re.sub(r"\s*\[[^\]]+\]\s*$", "", item).strip().lower()
+            if not normalized or any(keyword in normalized for keyword in ("door", "exit", "obvious")):
+                return
+            if any(keyword in normalized for keyword in ENEMY_KEYWORDS):
+                return
+            now = time.monotonic()
+            if now - self.last_item_inspect.get(normalized, 0.0) < 30.0:
+                return
+            self.last_item_inspect[normalized] = now
+
+            base_item = re.sub(r"\s*\[[^\]]+\]\s*$", "", item).strip()
+            raw_tokens = [token for token in re.split(r"\s+", base_item) if token]
+            filtered_tokens = [
+                token for token in raw_tokens if token.lower() not in {"a", "an", "the"}
+            ]
+            target_tokens = filtered_tokens or raw_tokens
+            target = target_tokens[-1].lower() if target_tokens else normalized
+
+            commands: List[str] = []
+            if 'sign' in normalized or 'map' in normalized:
+                commands.extend(["look sign", "read sign", "map", "look map"])
+            else:
+                commands.extend([f"look {target}", f"examine {target}"])
+
+            for keyword, topics in TALKATIVE_NPC_KEYWORDS.items():
+                if keyword in normalized:
+                    if time.monotonic() - self.last_npc_interaction.get(keyword, 0.0) < 40.0:
+                        break
+                    self.last_npc_interaction[keyword] = time.monotonic()
+                    name_token = target
+                    greeting_name = target_tokens[0] if target_tokens else keyword
+                    commands.append(f"say Greetings, {greeting_name}!")
+                    for topic in topics:
+                        commands.append(f"ask {name_token} about {topic}")
+                    break
+
+            if commands:
+                client.queue_script(commands)
 
         def consider_enemy(self, match: re.Match[str]):
             creature = match.group('creature').strip()
@@ -324,6 +515,168 @@ def configure_client(client):
             target = target.replace("'", "")
             client.queue_script([f"kill {target}"])
 
+        def _request_help(self, topic: str):
+            now = time.monotonic()
+            if now - self.last_help_request < 45.0:
+                return
+            self.last_help_request = now
+            client.queue_script([f"help {topic}", "hint"])
+
+        def handle_hint_line(self, match: re.Match[str]):
+            hint_text = match.group('hint').strip()
+            if not hint_text:
+                return
+            normalized = re.sub(r"\s+", " ", hint_text.lower())
+            now = time.monotonic()
+            if normalized == self.last_hint_text and now - self.last_hint_seen < 20.0:
+                return
+            self.last_hint_text = normalized
+            self.last_hint_seen = now
+
+            commands: List[str] = []
+            for topic in re.findall(r"help\s+([a-z]+)", normalized):
+                commands.append(f"help {topic}")
+            if "map" in normalized:
+                commands.extend(["map", "look map", "read map"])
+            if "ask" in normalized and "about" in normalized:
+                commands.append("hint")
+            if "talk" in normalized or "speak" in normalized:
+                commands.append("say How can I help?")
+            if not commands:
+                commands.append("hint")
+            else:
+                commands.append("hint")
+            client.queue_script(commands)
+
+        def handle_unknown_command(self, _match: Optional[re.Match[str]] = None):
+            self.unknown_command_count += 1
+            if self.unknown_command_count == 1:
+                client.queue_script(["hint"])
+            elif self.unknown_command_count >= 2:
+                self._request_help("commands")
+
+        def handle_blocked_path(self, _match: Optional[re.Match[str]] = None):
+            self.blocked_attempts += 1
+            self.queue_next_exit(alternate=True)
+            if self.blocked_attempts >= 2:
+                self._request_help("movement")
+
+        def handle_ask_prompt(self, _match: Optional[re.Match[str]] = None):
+            self._request_help("ask")
+
+        def respond_to_help_me(self, match: re.Match[str]):
+            npc = match.group('npc').strip()
+            now = time.monotonic()
+            key = npc.lower()
+            if now - self.last_helpful_prompt < 15.0 and self.last_hint_text:
+                return
+            if now - self.last_npc_interaction.get(key, 0.0) < 20.0:
+                return
+            self.last_helpful_prompt = now
+            self.last_npc_interaction[key] = now
+            name_token = re.split(r"\s+", npc)[0].lower()
+            client.queue_script(
+                [
+                    f"say How can I help you, {npc}?",
+                    f"ask {name_token} about help",
+                    f"ask {name_token} about work",
+                ]
+            )
+
+        def handle_board(self, _match: Optional[re.Match[str]] = None):
+            now = time.monotonic()
+            if now - self.last_board_check < 30.0:
+                return
+            self.last_board_check = now
+            client.queue_script(["look board", "read board", "read board all"])
+
+        def handle_shop_direction(self, match: re.Match[str]):
+            direction = match.group('direction').lower()
+            client.queue_script(self._commands_for_direction(direction))
+
+        def handle_help_suggestion(self, match: re.Match[str]):
+            topic = match.group('topic').strip().lower()
+            now = time.monotonic()
+            if now - self.last_hint_follow_up < 20.0:
+                return
+            self.last_hint_follow_up = now
+            client.queue_script([f"help {topic}", "hint"])
+
+        def handle_wake_up(self, _match: Optional[re.Match[str]] = None):
+            client.queue_script(["look", "inventory", "score"])
+
+        def handle_travel_advice(self, match: re.Match[str]):
+            npc = match.group('npc').strip().lower()
+            topic = re.split(r"\s+", npc)[0]
+            client.queue_script([f"help {topic}", f"where {topic}", "hint"])
+
+        def thank_driver(self, _match: Optional[re.Match[str]] = None):
+            client.queue_script(["say Thank you, driver.", "wave driver"])
+
+        def handle_empty_search(self, _match: Optional[re.Match[str]] = None):
+            now = time.monotonic()
+            if now - self.last_search_fail < 20.0:
+                return
+            self.last_search_fail = now
+            self.queue_next_exit(alternate=True)
+            client.queue_script(["look", "hint"])
+
+        def handle_empty_take(self, _match: Optional[re.Match[str]] = None):
+            now = time.monotonic()
+            if now - self.last_empty_take < 20.0:
+                return
+            self.last_empty_take = now
+            client.queue_script(["inventory", "search", "hint"])
+
+        def queue_next_exit(self, alternate: bool = False):
+            if not self.last_exit_options:
+                return
+            if alternate:
+                if len(self.last_exit_options) <= 1:
+                    return
+                next_index = (self.last_exit_choice_index + 1) % len(
+                    self.last_exit_options
+                )
+            else:
+                next_index = self.last_exit_choice_index
+            if next_index == -1:
+                next_index = 0
+            self.last_exit_choice_index = next_index
+            direction = self.last_exit_options[self.last_exit_choice_index]
+            client.queue_script(self._commands_for_direction(direction))
+
+        def handle_exits(self, match: re.Match[str]):
+            exits_text = match.group('exits')
+            cleaned = exits_text.replace(' and ', ', ')
+            options = [
+                option.strip().lower()
+                for option in re.split(r",|/", cleaned)
+                if option.strip()
+            ]
+            if not options:
+                return
+            self.unknown_command_count = 0
+            self.blocked_attempts = 0
+            normalized_options = tuple(options)
+            if normalized_options == self.last_exit_options:
+                next_index = (self.last_exit_choice_index + 1) % len(options)
+            else:
+                next_index = 0
+            self.last_exit_options = normalized_options
+            self.last_exit_choice_index = next_index
+            direction = options[next_index]
+            client.queue_script(self._commands_for_direction(direction))
+
+        def _commands_for_direction(self, direction: str) -> List[str]:
+            commands: List[str] = []
+            if direction in {"up", "down"}:
+                commands.append(f"go {direction}")
+            elif direction in {"stairs", "ladder"}:
+                commands.append(f"climb {direction}")
+            commands.append(direction)
+            commands.append("look")
+            return commands
+
     login = LoginCoordinator()
     world = WorldInteractor()
 
@@ -334,44 +687,45 @@ def configure_client(client):
             return
         scenario_state["started"] = True
         login.reset()
-        client.queue_script(
-            [
-                "look",
-                "say Greetings, everyone!",
-                "read sign",
-                "ask messenger rumours",
-                "open east door",
-                "east",
-                "look",
-                "search",
-                "get all",
-                "west",
-                "say Does anyone need assistance?",
-                "north",
-                "look",
-                "say I'm looking for adventure.",
-                "west",
-                "look",
-                "southwest",
-                "look",
-            ]
-        )
+        script: List[str] = list(BASE_SCENARIO_SCRIPT)
+        script.extend(profile.intro_script)
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for command in script:
+            normalized = command.strip().lower()
+            if not normalized:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(command)
+        client.queue_script(deduped)
+        client.start_automation()
+
+    def handle_reconnect():
+        scenario_state["started"] = False
+        login.reset()
+        world.last_exit_options = ()
+        world.last_exit_choice_index = -1
+        client.queue_script(["look", "exits", "hint"])
         client.start_automation()
 
     for prompt in USERNAME_PROMPTS:
         client.add_trigger(prompt, login.send_username, flags=re.IGNORECASE)
     for prompt in PASSWORD_PROMPTS:
         client.add_trigger(prompt, login.send_password, flags=re.IGNORECASE)
+    for prompt in RECONNECT_PROMPTS:
+        client.add_trigger(prompt, handle_reconnect, flags=re.IGNORECASE | re.MULTILINE)
 
     client.add_trigger(LOGIN_SUCCESS_PATTERN, start_scenario, flags=re.IGNORECASE)
     client.add_trigger(
-        r"Welcome to Arda,\s+%s!" % re.escape(USERNAME),
+        r"Welcome to Arda,\s+%s!" % re.escape(profile.username),
         start_scenario,
         flags=re.IGNORECASE,
     )
     client.add_trigger(
         r"Ragakh says in Westron: What is your name, young one\?",
-        f"say {USERNAME}",
+        f"say {profile.username}",
         flags=re.IGNORECASE,
         once=True,
     )
@@ -414,24 +768,121 @@ def configure_client(client):
         flags=re.IGNORECASE | re.MULTILINE,
         use_match=True,
     )
+    client.add_trigger(
+        r"(?m)^\s*(?:An|A|The) (?P<item>[^\[]+?)(?:\s*\[[0-9]+\])?\s*$",
+        world.inspect_item,
+        flags=re.IGNORECASE | re.MULTILINE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"The only obvious exits are (?P<exits>[^.]+)\.",
+        world.handle_exits,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"Obvious exits: (?P<exits>[^\r\n]+)",
+        world.handle_exits,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(r"\bWhat\?\s*$", world.handle_unknown_command, flags=re.MULTILINE)
+    client.add_trigger(
+        r"You can't go that way!",
+        world.handle_blocked_path,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"Ask <who> about <what>\?",
+        world.handle_ask_prompt,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"Hint:\s*(?P<hint>.+)",
+        world.handle_hint_line,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"Tip:\s*(?P<hint>.+)",
+        world.handle_hint_line,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"(?i)notice ?board",
+        world.handle_board,
+    )
+    client.add_trigger(
+        r"There seems to be a shop to the (?P<direction>north|south|east|west)",
+        world.handle_shop_direction,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r'Type "help (?P<topic>[^"]+)"',
+        world.handle_help_suggestion,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"(?P<npc>[A-Z][\w' -]+) says in Westron: Hey you!\s*Maybe you can help me\?",
+        world.respond_to_help_me,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"You regain consciousness\.",
+        world.handle_wake_up,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"you should see (?P<npc>[^.]+) after you've grown up a bit",
+        world.handle_travel_advice,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"The driver turns to you",
+        world.thank_driver,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"You search but fail to find anything of interest\.",
+        world.handle_empty_search,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"There is nothing here to get\.",
+        world.handle_empty_take,
+        flags=re.IGNORECASE,
+    )
 
 
-def create_configured_client():
+def create_configured_client(profile: CharacterProfile):
     client = T2TMUDClient(HOST, PORT)
-    configure_client(client)
+    configure_client(client, profile)
     client.connect(print_out)
     return client
 
 
 def main():
-    client = create_configured_client()
+    profile_index = 0
+    current_profile = CHARACTER_PROFILES[profile_index]
+    client = create_configured_client(current_profile)
 
     try:
         while True:
             cmd = input("")
-            if cmd.strip() == "quit":
-                client.close()  # Close the old connection
-                client = create_configured_client()
+            stripped = cmd.strip().lower()
+            if stripped == "quit":
+                client.close()
+                client = create_configured_client(current_profile)
+            elif stripped == "switch":
+                client.close()
+                profile_index = (profile_index + 1) % len(CHARACTER_PROFILES)
+                current_profile = CHARACTER_PROFILES[profile_index]
+                client = create_configured_client(current_profile)
             else:
                 client.send(cmd)
 
