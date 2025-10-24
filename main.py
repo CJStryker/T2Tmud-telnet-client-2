@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import select
 import socket
 import sys
 import telnetlib
@@ -171,6 +172,7 @@ class GameKnowledge:
         "charinfo",
         "legendinfo",
         "map",
+        "consider <target>",
         "travelto <destination>",
         "travelto resume",
         "exits",
@@ -216,9 +218,12 @@ class GameKnowledge:
         "ask <npc> about work",
         "ask <npc> about rumours",
         "ask <npc> about travel",
+        "ask <npc> about jobs",
         "buy <item>",
         "sell <item>",
         "order <item>",
+        "list",
+        "value <item>",
         "hint",
         "help <topic>",
     )
@@ -238,6 +243,9 @@ class GameKnowledge:
         "give <amount> gold to <npc>",
         "offer",
         "pay <npc>",
+        "sell <item>",
+        "value <item>",
+        "list",
     )
 
     COMBAT_COMMANDS: Sequence[str] = (
@@ -247,6 +255,8 @@ class GameKnowledge:
         "cast <spell>",
         "shield",
         "rescue <ally>",
+        "get all corpse",
+        "get coins",
     )
 
     STRATEGY_GUIDELINES: Sequence[str] = (
@@ -256,10 +266,13 @@ class GameKnowledge:
         "Interact with NPCs using 'say' and 'ask <npc> about <topic>'.",
         "Follow signposts with 'travelto <destination>' and let the journey finish before issuing other commands; resume with 'travelto resume' if paused.",
         "Seek supplies in taverns: 'order <item>', 'rent room', and 'rest' recover resources faster when others are nearby.",
-        "If gold is low, explore new rooms, search containers, loot corpses with 'get coins' or 'get all corpse', and sell excess gear before attempting large purchases.",
-        "Before engaging, 'consider <target>' to judge difficulty, focus on low-level creatures, and finish foes quickly to gather loot.",
-        "After combat, loot coins and valuables, then visit shops or innkeepers to buy food, gear, or lodging.",
+        "If gold is low, explore nearby streets, wilderness, or hunting grounds, search containers, loot corpses with 'get coins' or 'get all corpse', and sell excess gear before attempting large purchases.",
+        "Before engaging, 'consider <target>' to judge difficulty, focus on low-level creatures or obvious foes, and be ready to 'flee' if health drops.",
+        "After combat, loot coins and valuables, then visit shops or innkeepers to 'list', 'value', 'sell', or 'buy' needed items.",
         "Follow rumours, message boards, and NPC dialogue for hints about hunting grounds or profitable activities.",
+        "When a shopkeeper or quest giver refuses to help, try other NPCs, different topics such as 'work', 'rumours', 'jobs', or explore outside to find creatures to hunt.",
+        "If movement is blocked, pick another exit or resume 'travelto' journeys from the last signpost.",
+        "Restock resources by resting, eating, or renting rooms when coins allow; gather more money before renting if refused.",
         "When help topics suggest more reading, queue follow-up 'help <topic>' calls.",
         "When '--More--' pagination appears, send a blank command to continue.",
         "Avoid repeating the same command rapidly if the game says you cannot do it.",
@@ -589,6 +602,23 @@ PASSWORD_PATTERNS = [
 ]
 MORE_PATTERN = re.compile(r"--More--")
 PRESS_ENTER_PATTERN = re.compile(r"Press ENTER for next page", re.IGNORECASE)
+DIRECTION_BLOCK_PATTERN = re.compile(r"You can't go that way!", re.IGNORECASE)
+TARGET_MISSING_PATTERN = re.compile(r"You don't see that here\.", re.IGNORECASE)
+TAKE_MISSING_PATTERN = re.compile(r"There is no [^\n]+ here to get\.", re.IGNORECASE)
+STEALING_PATTERN = re.compile(r"That would be stealing!", re.IGNORECASE)
+MULTI_TARGET_PATTERN = re.compile(r"You see more than one", re.IGNORECASE)
+ASK_BLANK_PATTERN = re.compile(
+    r"(?P<npc>[A-Z][\w' -]+) says in [^:]+: I don't know about that\.",
+    re.IGNORECASE,
+)
+REST_START_PATTERN = re.compile(
+    r"You sit back, relax, and enjoy a nice rest\.",
+    re.IGNORECASE,
+)
+REST_INTERRUPT_PATTERN = re.compile(
+    r"Your actions interrupt your rest\.",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -782,6 +812,73 @@ class TelnetSession:
                 self._planner.request_commands("search failed")
             self._remove_match(match)
             return
+        match = DIRECTION_BLOCK_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "Movement blocked; choose another direction or resume travelto")
+            if self._planner:
+                self._planner.note_event("Path blocked by obstacle")
+                self._planner.request_commands("movement blocked")
+            self._remove_match(match)
+            return
+        match = TARGET_MISSING_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "Target not present; try examining the room or another NPC")
+            if self._planner:
+                self._planner.note_event("Attempted interaction failed; target missing")
+                self._planner.request_commands("target missing")
+            self._remove_match(match)
+            return
+        match = TAKE_MISSING_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "No such item to take here; search or hunt for loot")
+            if self._planner:
+                self._planner.note_event("Failed to pick up item")
+                self._planner.request_commands("item missing")
+            self._remove_match(match)
+            return
+        match = STEALING_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "Stealing is not allowed here; find lawful ways to earn gold")
+            if self._planner:
+                self._planner.note_event("Stealing attempt blocked")
+                self._planner.request_commands("stealing blocked")
+            self._remove_match(match)
+            return
+        match = MULTI_TARGET_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "Multiple targets found; specify which NPC or item to interact with")
+            if self._planner:
+                self._planner.note_event("Need to disambiguate multi-target selection")
+                self._planner.request_commands("multiple targets")
+            self._remove_match(match)
+            return
+        match = ASK_BLANK_PATTERN.search(self._buffer)
+        if match:
+            npc = "An NPC"
+            if "npc" in match.groupdict():
+                npc = match.group("npc").strip()
+            self.display.emit("event", f"{npc} has no answer; try another topic or character")
+            if self._planner:
+                self._planner.note_event(f"{npc} offered no information")
+                self._planner.request_commands("npc unhelpful")
+            self._remove_match(match)
+            return
+        match = REST_START_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "Resting to recover; monitor HP/EP before resuming hunts")
+            if self._planner:
+                self._planner.note_event("Rest started")
+                self._planner.request_commands("resting")
+            self._remove_match(match)
+            return
+        match = REST_INTERRUPT_PATTERN.search(self._buffer)
+        if match:
+            self.display.emit("event", "Rest interrupted; consider resuming or pursuing another action")
+            if self._planner:
+                self._planner.note_event("Rest interrupted")
+                self._planner.request_commands("rest interrupted")
+            self._remove_match(match)
+            return
         enemy_match = TARGET_LINE_PATTERN.search(self._buffer)
         if enemy_match:
             raw_name = enemy_match.group("name").strip()
@@ -864,15 +961,21 @@ class ConsoleInputThread(threading.Thread):
     def run(self):
         while not self._stop.is_set():
             try:
-                line = sys.stdin.readline()
-            except KeyboardInterrupt:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+            except (KeyboardInterrupt, OSError, ValueError):
                 break
-            if not line:
+            if self._stop.is_set():
+                break
+            if not ready:
+                continue
+            line = sys.stdin.readline()
+            if line == "":
                 break
             command = line.rstrip("\n")
             if command.strip().lower() in {":exit", ":quit"}:
                 self.session.display.emit("event", "Local shutdown requested")
                 self.session.disconnect()
+                self._stop.set()
                 break
             if command:
                 self.session.send_command(command, source="input")
@@ -887,22 +990,6 @@ class ConsoleInputThread(threading.Thread):
 # Application bootstrap
 ###############################################################################
 
-    profile = DEFAULT_PROFILES[0]
-    try:
-        session.connect(profile)
-    except RuntimeError as exc:
-        display.emit("error", str(exc))
-        planner.shutdown()
-        return
-
-    display.emit("event", "Type commands directly; use :exit to close locally.")
-    if OLLAMA_ENABLED:
-        display.emit("event", "Ollama automation is active and will respond after prompts.")
-    else:
-        display.emit("event", "Ollama automation is disabled via configuration.")
-
-    input_thread = ConsoleInputThread(session)
-    input_thread.start()
 
 def run_client():
     display = TerminalDisplay()
@@ -941,6 +1028,7 @@ def run_client():
         display.emit("event", "Interrupted locally; closing session.")
     finally:
         input_thread.stop()
+        input_thread.join(timeout=1.0)
         session.disconnect()
         planner.shutdown()
         display.ensure_newline()
