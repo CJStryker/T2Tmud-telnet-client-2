@@ -887,6 +887,22 @@ class ConsoleInputThread(threading.Thread):
 # Application bootstrap
 ###############################################################################
 
+    profile = DEFAULT_PROFILES[0]
+    try:
+        session.connect(profile)
+    except RuntimeError as exc:
+        display.emit("error", str(exc))
+        planner.shutdown()
+        return
+
+    display.emit("event", "Type commands directly; use :exit to close locally.")
+    if OLLAMA_ENABLED:
+        display.emit("event", "Ollama automation is active and will respond after prompts.")
+    else:
+        display.emit("event", "Ollama automation is disabled via configuration.")
+
+    input_thread = ConsoleInputThread(session)
+    input_thread.start()
 
 def run_client():
     display = TerminalDisplay()
