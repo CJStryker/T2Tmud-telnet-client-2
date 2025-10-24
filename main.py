@@ -26,6 +26,17 @@ DEFAULT_AUTOMATION_COMMANDS = (
     "help commands",
     "help movement",
     "help combat",
+    "help start",
+    "help list",
+    "help rules",
+    "help concepts",
+    "help theme",
+    "help help",
+    "charinfo",
+    "legendinfo",
+    "quests",
+    "mission",
+    "hint random",
 )
 AUTOMATION_DELAY_SECONDS = 2.5
 LOGIN_SUCCESS_PATTERN = r"HP:\s*\d+\s+EP:\s*\d+>"
@@ -128,10 +139,18 @@ BASE_SCENARIO_SCRIPT: Tuple[str, ...] = (
     "help combat",
     "help survival",
     "help movement",
+    "help start",
+    "help help",
+    "help rules",
+    "help concepts",
+    "help theme",
+    "help list",
     "help map",
     "help hint",
     "help guilds",
     "help quests",
+    "help faq",
+    "faq",
     "score",
     "inventory",
     "equipment",
@@ -189,7 +208,7 @@ OutputHandler = Callable[[str, Optional[str]], None]
 
 
 class T2TMUDClient:
-    def __init__(self, h, p):
+    def __init__(self, h, p, *, on_disconnect: Optional[Callable[[bool], None]] = None):
         self.host = h
         self.port = p
         self.connection: Optional[telnetlib.Telnet] = None
@@ -205,6 +224,9 @@ class T2TMUDClient:
         self._automation_cycle_index = 0
         self._automation_lock = threading.Lock()
         self.profile: Optional[CharacterProfile] = None
+        self.on_disconnect = on_disconnect
+        self._closing = False
+        self._pause_condition: Optional[Callable[[], bool]] = None
 
     def connect(self, output: OutputHandler):
         self.output = output
@@ -250,6 +272,11 @@ class T2TMUDClient:
         finally:
             self.stop_automation()
             self.connection = None
+            on_disconnect = self.on_disconnect
+            closing = self._closing
+            self._closing = False
+        if on_disconnect:
+            on_disconnect(not closing)
 
     def send(self, cmd):
         if not self.connection:
@@ -257,11 +284,13 @@ class T2TMUDClient:
         self.connection.write(f"{cmd}\n".encode('ascii'))
         self.log.append(('client', cmd.strip()))
 
-    def close(self):
+    def close(self, send_quit: bool = True):
         if not self.connection:
             return
         try:
-            self.send('quit')
+            self._closing = True
+            if send_quit:
+                self.send('quit')
         finally:
             try:
                 self.connection.close()
@@ -311,6 +340,9 @@ class T2TMUDClient:
             self._automation_cycle_index = 0
             self.automation_delay = delay
 
+    def set_pause_condition(self, func: Optional[Callable[[], bool]]):
+        self._pause_condition = func
+
     def queue_script(self, commands):
         with self._automation_lock:
             for command in commands:
@@ -350,6 +382,9 @@ class T2TMUDClient:
 
     def _automation_loop(self):
         while self._automation_running.is_set():
+            if self._pause_condition and self._pause_condition():
+                time.sleep(0.25)
+                continue
             command = self._next_automation_command()
             if not self._automation_running.is_set():
                 break
@@ -398,6 +433,11 @@ def configure_client(client, profile: CharacterProfile):
 
     class WorldInteractor:
         def __init__(self):
+            self.profile = profile
+            self._reset_state()
+
+        def _reset_state(self):
+            now = time.monotonic()
             self.last_greeting: Dict[str, float] = {}
             self.last_sign_seen = 0.0
             self.last_map_check = 0.0
@@ -417,7 +457,18 @@ def configure_client(client, profile: CharacterProfile):
             self.last_search_fail = 0.0
             self.last_empty_take = 0.0
             self.last_helpful_prompt = 0.0
-            self.profile = profile
+            self.awaiting_more = False
+            self.last_more_prompt = 0.0
+            self.help_topics_read = 0
+            self.help_topics_seen: Dict[str, float] = {}
+            self.session_started_at = now
+            self.quit_scheduled = False
+            self.last_quit_check = 0.0
+            self.last_not_found = 0.0
+            self.no_help_topic_recent = 0.0
+
+        def reset_for_new_session(self):
+            self._reset_state()
 
         def greet(self, match: re.Match[str]):
             speaker = match.group('speaker').strip()
@@ -493,7 +544,7 @@ def configure_client(client, profile: CharacterProfile):
                         break
                     self.last_npc_interaction[keyword] = time.monotonic()
                     name_token = target
-                    greeting_name = target_tokens[0] if target_tokens else keyword
+                    greeting_name = (target_tokens[0] if target_tokens else keyword)
                     commands.append(f"say Greetings, {greeting_name}!")
                     for topic in topics:
                         commands.append(f"ask {name_token} about {topic}")
@@ -628,6 +679,88 @@ def configure_client(client, profile: CharacterProfile):
             self.last_empty_take = now
             client.queue_script(["inventory", "search", "hint"])
 
+        def handle_not_found(self, _match: Optional[re.Match[str]] = None):
+            now = time.monotonic()
+            if now - self.last_not_found < 20.0:
+                return
+            self.last_not_found = now
+            self.queue_next_exit(alternate=True)
+            client.queue_script(["look", "hint"])
+
+        def handle_no_help_topic(self, _match: Optional[re.Match[str]] = None):
+            now = time.monotonic()
+            if now - self.no_help_topic_recent < 20.0:
+                return
+            self.no_help_topic_recent = now
+            client.queue_script(["help list", "hint"])
+
+        def handle_status_prompt(self, _match: Optional[re.Match[str]] = None):
+            self.awaiting_more = False
+            self.schedule_quit_if_ready()
+
+        def handle_help_header(self, match: re.Match[str]):
+            self.awaiting_more = True
+            self.last_more_prompt = time.monotonic()
+            self.help_topics_read += 1
+            self.schedule_quit_if_ready()
+
+        def handle_help_bullet(self, match: re.Match[str]):
+            topic = match.group('topic').strip()
+            topic = re.sub(r"\s*-.*$", "", topic).strip()
+            if not topic:
+                return
+            normalized = re.sub(r"\s+", " ", topic.lower())
+            now = time.monotonic()
+            if now - self.help_topics_seen.get(normalized, 0.0) < 60.0:
+                return
+            self.help_topics_seen[normalized] = now
+            client.queue_script([f"help {topic.lower()}"])
+
+        def handle_more_prompt(self, _match: Optional[re.Match[str]] = None):
+            now = time.monotonic()
+            self.awaiting_more = True
+            previous = self.last_more_prompt
+            self.last_more_prompt = now
+            if now - previous > 0.35:
+                client.send("")
+
+        def handle_more_error(self, _match: Optional[re.Match[str]] = None):
+            self.awaiting_more = True
+            self.last_more_prompt = time.monotonic()
+            client.send("")
+
+        def handle_press_enter_prompt(self, _match: Optional[re.Match[str]] = None):
+            self.awaiting_more = True
+            self.last_more_prompt = time.monotonic()
+            client.send("")
+
+        def should_pause_automation(self) -> bool:
+            if not self.awaiting_more:
+                return False
+            if time.monotonic() - self.last_more_prompt > 10.0:
+                self.awaiting_more = False
+                return False
+            return True
+
+        def schedule_quit_if_ready(self):
+            if self.quit_scheduled or self.awaiting_more:
+                return
+            now = time.monotonic()
+            if now - self.session_started_at < 60.0 and self.help_topics_read < 5:
+                return
+            if now - self.last_quit_check < 5.0:
+                return
+            self.last_quit_check = now
+            self.quit_scheduled = True
+            client.queue_script(
+                [
+                    "say I should check on another path.",
+                    "hint",
+                    "save",
+                    "quit",
+                ]
+            )
+
         def queue_next_exit(self, alternate: bool = False):
             if not self.last_exit_options:
                 return
@@ -680,6 +813,8 @@ def configure_client(client, profile: CharacterProfile):
     login = LoginCoordinator()
     world = WorldInteractor()
 
+    client.set_pause_condition(world.should_pause_automation)
+
     scenario_state = {"started": False}
 
     def start_scenario():
@@ -687,6 +822,7 @@ def configure_client(client, profile: CharacterProfile):
             return
         scenario_state["started"] = True
         login.reset()
+        world.reset_for_new_session()
         script: List[str] = list(BASE_SCENARIO_SCRIPT)
         script.extend(profile.intro_script)
         deduped: List[str] = []
@@ -705,8 +841,7 @@ def configure_client(client, profile: CharacterProfile):
     def handle_reconnect():
         scenario_state["started"] = False
         login.reset()
-        world.last_exit_options = ()
-        world.last_exit_choice_index = -1
+        world.reset_for_new_session()
         client.queue_script(["look", "exits", "hint"])
         client.start_automation()
 
@@ -718,6 +853,7 @@ def configure_client(client, profile: CharacterProfile):
         client.add_trigger(prompt, handle_reconnect, flags=re.IGNORECASE | re.MULTILINE)
 
     client.add_trigger(LOGIN_SUCCESS_PATTERN, start_scenario, flags=re.IGNORECASE)
+    client.add_trigger(LOGIN_SUCCESS_PATTERN, world.handle_status_prompt, flags=re.IGNORECASE)
     client.add_trigger(
         r"Welcome to Arda,\s+%s!" % re.escape(profile.username),
         start_scenario,
@@ -793,6 +929,11 @@ def configure_client(client, profile: CharacterProfile):
         flags=re.IGNORECASE,
     )
     client.add_trigger(
+        r"You don't see that here\.",
+        world.handle_not_found,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
         r"Ask <who> about <what>\?",
         world.handle_ask_prompt,
         flags=re.IGNORECASE,
@@ -857,38 +998,145 @@ def configure_client(client, profile: CharacterProfile):
         world.handle_empty_take,
         flags=re.IGNORECASE,
     )
+    client.add_trigger(
+        r"There is no help available on that topic\.",
+        world.handle_no_help_topic,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"--More--",
+        world.handle_more_prompt,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"Press ENTER for next page",
+        world.handle_press_enter_prompt,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"Unrecognized \"More\" command",
+        world.handle_more_error,
+        flags=re.IGNORECASE,
+    )
+    client.add_trigger(
+        r"Help for (?P<topic>[^\n]+)",
+        world.handle_help_header,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
+    client.add_trigger(
+        r"(?m)^\s*\*\s*help\s+(?P<topic>[a-z][\w' -]*)",
+        world.handle_help_bullet,
+        flags=re.IGNORECASE,
+        use_match=True,
+    )
 
 
-def create_configured_client(profile: CharacterProfile):
-    client = T2TMUDClient(HOST, PORT)
+class SessionManager:
+    def __init__(self):
+        self.profile_index = 0
+        self.client: Optional[T2TMUDClient] = None
+        self.lock = threading.Lock()
+        self.pending_action: Optional[str] = None
+        self.shutdown_requested = False
+
+    def start(self):
+        self._connect_current()
+
+    def _connect_current(self):
+        profile = CHARACTER_PROFILES[self.profile_index]
+        print(f"Connecting as {profile.username}...", flush=True)
+        client = create_configured_client(profile, on_disconnect=self._handle_disconnect)
+        with self.lock:
+            self.client = client
+
+    def _handle_disconnect(self, by_server: bool):
+        with self.lock:
+            if self.shutdown_requested:
+                return
+            action = self.pending_action
+            self.pending_action = None
+            rotate = False
+            if action == "shutdown":
+                self.shutdown_requested = True
+                return
+            if action == "switch":
+                rotate = True
+            elif action == "reconnect":
+                rotate = False
+            elif by_server:
+                rotate = True
+            if rotate:
+                self.profile_index = (self.profile_index + 1) % len(CHARACTER_PROFILES)
+        if self.shutdown_requested:
+            return
+        time.sleep(1.0)
+        self._connect_current()
+
+    def request_switch(self):
+        with self.lock:
+            client = self.client
+            if not client:
+                return
+            self.pending_action = "switch"
+        client.close()
+
+    def request_reconnect(self):
+        with self.lock:
+            client = self.client
+            if not client:
+                return
+            self.pending_action = "reconnect"
+        client.close()
+
+    def send(self, command: str):
+        with self.lock:
+            client = self.client
+        if client:
+            client.send(command)
+
+    def shutdown(self):
+        with self.lock:
+            client = self.client
+            self.client = None
+            self.pending_action = "shutdown"
+            self.shutdown_requested = True
+        if client:
+            client.close()
+
+
+def create_configured_client(
+    profile: CharacterProfile, *, on_disconnect: Optional[Callable[[bool], None]] = None
+):
+    client = T2TMUDClient(HOST, PORT, on_disconnect=on_disconnect)
     configure_client(client, profile)
     client.connect(print_out)
     return client
 
 
 def main():
-    profile_index = 0
-    current_profile = CHARACTER_PROFILES[profile_index]
-    client = create_configured_client(current_profile)
+    manager = SessionManager()
+    manager.start()
 
     try:
         while True:
             cmd = input("")
             stripped = cmd.strip().lower()
-            if stripped == "quit":
-                client.close()
-                client = create_configured_client(current_profile)
-            elif stripped == "switch":
-                client.close()
-                profile_index = (profile_index + 1) % len(CHARACTER_PROFILES)
-                current_profile = CHARACTER_PROFILES[profile_index]
-                client = create_configured_client(current_profile)
+            if stripped == "switch":
+                manager.request_switch()
+            elif stripped in {"reconnect", "reset"}:
+                manager.request_reconnect()
+            elif stripped in {"shutdown", "exit"}:
+                manager.shutdown()
+                break
             else:
-                client.send(cmd)
-
+                manager.send(cmd)
     except (EOFError, KeyboardInterrupt):
-        client.close()
+        manager.shutdown()
         print("Disconnected.")
+    else:
+        print("Disconnected.")
+
 
 if __name__ == '__main__':
     main()
