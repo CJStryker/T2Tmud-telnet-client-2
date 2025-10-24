@@ -49,6 +49,7 @@ class T2TMUDClient:
         self.automation_delay = AUTOMATION_DELAY_SECONDS
         self._automation_running = threading.Event()
         self._automation_thread = None
+        self._trigger_buffer = ""
 
     def connect(self, output: OutputHandler):
         self.output = output
@@ -75,10 +76,14 @@ class T2TMUDClient:
                 if not data:
                     continue
 
+                self._trigger_buffer += data
+                if len(self._trigger_buffer) > 8192:
+                    self._trigger_buffer = self._trigger_buffer[-4096:]
+
                 self.log.append(('server', data.replace('\r', '')))
                 if self.output:
                     self.output(data, None)
-                self.check_triggers(data)
+                self.check_triggers()
         except EOFError:
             self.log.append(('error', 'Connection closed.'))
             if self.output:
@@ -115,18 +120,22 @@ class T2TMUDClient:
         compiled = re.compile(pattern, flags)
         self.triggers.append((compiled, action, once))
 
-    def check_triggers(self, data):
+    def check_triggers(self):
         indices_to_remove = []
+        triggered = False
         for idx, (pattern, action, once) in enumerate(self.triggers):
-            if pattern.search(data):
+            if pattern.search(self._trigger_buffer):
                 if callable(action):
                     action()
                 else:
                     self.send(action)
+                triggered = True
                 if once:
                     indices_to_remove.append(idx)
         for idx in reversed(indices_to_remove):
             del self.triggers[idx]
+        if triggered:
+            self._trigger_buffer = ""
 
     def set_automation(self, commands, delay):
         self.automation_commands = list(commands)
@@ -159,34 +168,59 @@ class T2TMUDClient:
                 time.sleep(self.automation_delay)
 
 def print_out(text, _):
-    print(text, end='')
+    cleaned = text.replace('\r\n', '\n').replace('\r', '\n')
+    print(cleaned, end='')
 
 
 def configure_client(client):
     client.set_automation(DEFAULT_AUTOMATION_COMMANDS, AUTOMATION_DELAY_SECONDS)
-    sent_username = False
-    sent_password = False
 
-    def send_username():
-        nonlocal sent_username
-        if sent_username:
-            return
-        client.send(USERNAME)
-        sent_username = True
+    class LoginCoordinator:
+        def __init__(self):
+            self.username_sent_at = 0.0
+            self.password_sent_at = 0.0
 
-    def send_password():
-        nonlocal sent_password
-        if sent_password:
-            return
-        client.send(PASSWORD)
-        sent_password = True
+        def _should_send(self, last_sent_at: float) -> bool:
+            now = time.monotonic()
+            return (now - last_sent_at) >= 1.0
+
+        def send_username(self):
+            if not self._should_send(self.username_sent_at):
+                return
+            self.username_sent_at = time.monotonic()
+            client.send(USERNAME)
+
+        def send_password(self):
+            if not self._should_send(self.password_sent_at):
+                return
+            if self.username_sent_at == 0.0:
+                self.username_sent_at = time.monotonic()
+                client.send(USERNAME)
+            client.send(PASSWORD)
+            self.password_sent_at = time.monotonic()
+
+        def reset(self):
+            self.username_sent_at = 0.0
+            self.password_sent_at = 0.0
+
+    login = LoginCoordinator()
+
+    def handle_login_success():
+        login.reset()
+        client.start_automation()
 
     for prompt in USERNAME_PROMPTS:
-        client.add_trigger(prompt, send_username, flags=re.IGNORECASE, once=True)
+        client.add_trigger(prompt, login.send_username, flags=re.IGNORECASE)
     for prompt in PASSWORD_PROMPTS:
-        client.add_trigger(prompt, send_password, flags=re.IGNORECASE, once=True)
-
-    client.add_trigger(LOGIN_SUCCESS_PATTERN, client.start_automation, flags=re.IGNORECASE, once=True)
+        client.add_trigger(prompt, login.send_password, flags=re.IGNORECASE)
+    client.add_trigger(LOGIN_SUCCESS_PATTERN, handle_login_success, flags=re.IGNORECASE)
+    client.add_trigger(r"Welcome to Arda,\s+%s!" % re.escape(USERNAME), handle_login_success, flags=re.IGNORECASE)
+    client.add_trigger(
+        r"Ragakh says in Westron: What is your name, young one\?",
+        f"say {USERNAME}",
+        flags=re.IGNORECASE,
+        once=True,
+    )
 
 
 def create_configured_client():
