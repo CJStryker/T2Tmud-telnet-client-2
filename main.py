@@ -957,12 +957,15 @@ class ConsoleInputThread(threading.Thread):
         super().__init__(daemon=True)
         self.session = session
         self._stop = threading.Event()
+        self.exit_requested = False
 
     def run(self):
         while not self._stop.is_set():
             try:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.2)
             except (KeyboardInterrupt, OSError, ValueError):
+                self.exit_requested = True
+                self._stop.set()
                 break
             if self._stop.is_set():
                 break
@@ -970,12 +973,14 @@ class ConsoleInputThread(threading.Thread):
                 continue
             line = sys.stdin.readline()
             if line == "":
+                self.exit_requested = True
                 break
             command = line.rstrip("\n")
             if command.strip().lower() in {":exit", ":quit"}:
                 self.session.display.emit("event", "Local shutdown requested")
                 self.session.disconnect()
                 self._stop.set()
+                self.exit_requested = True
                 break
             if command:
                 self.session.send_command(command, source="input")
@@ -993,6 +998,11 @@ class ConsoleInputThread(threading.Thread):
 
 def run_client():
     display = TerminalDisplay()
+    if not DEFAULT_PROFILES:
+        display.emit("error", "No character profiles configured.")
+        display.ensure_newline()
+        return
+
     knowledge_text = GameKnowledge.build_reference()
     session = TelnetSession(display)
     planner = OllamaPlanner(
@@ -1002,34 +1012,54 @@ def run_client():
     )
     session.attach_planner(planner)
 
-    profile = DEFAULT_PROFILES[0]
-    try:
-        session.connect(profile)
-    except RuntimeError as exc:
-        display.emit("error", str(exc))
-        planner.shutdown()
-        return
-
-    display.emit("event", "Type commands directly; use :exit to close locally.")
-    if OLLAMA_ENABLED:
-        display.emit("event", "Ollama automation is active and will respond after prompts.")
-    else:
-        display.emit("event", "Ollama automation is disabled via configuration.")
-
     input_thread = ConsoleInputThread(session)
     input_thread.start()
 
+    profile_index = 0
+    instructions_shown = False
+
     try:
-        while True:
-            if not session._listener or not session._listener.is_alive():
+        while not input_thread.exit_requested:
+            profile = DEFAULT_PROFILES[profile_index]
+            try:
+                session.connect(profile)
+            except RuntimeError as exc:
+                display.emit("error", str(exc))
+                if input_thread.exit_requested:
+                    break
+                time.sleep(5.0)
+                profile_index = (profile_index + 1) % len(DEFAULT_PROFILES)
+                continue
+
+            if not instructions_shown:
+                display.emit("event", "Type commands directly; use :exit to close locally.")
+                if OLLAMA_ENABLED:
+                    display.emit("event", "Ollama automation is active and will respond after prompts.")
+                else:
+                    display.emit("event", "Ollama automation is disabled via configuration.")
+                instructions_shown = True
+
+            while not input_thread.exit_requested:
+                listener = session._listener
+                if not listener or not listener.is_alive():
+                    break
+                time.sleep(0.5)
+
+            if session._listener is not None or session.connection is not None:
+                session.disconnect()
+
+            if input_thread.exit_requested:
                 break
-            time.sleep(0.5)
+
+            profile_index = (profile_index + 1) % len(DEFAULT_PROFILES)
+            time.sleep(3.0)
     except KeyboardInterrupt:
         display.emit("event", "Interrupted locally; closing session.")
     finally:
         input_thread.stop()
         input_thread.join(timeout=1.0)
-        session.disconnect()
+        if session._listener is not None or session.connection is not None:
+            session.disconnect()
         planner.shutdown()
         display.ensure_newline()
 
