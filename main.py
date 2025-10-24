@@ -206,13 +206,13 @@ BASE_SCENARIO_SCRIPT: Tuple[str, ...] = (
 
 TriggerAction = Union[str, Callable[[], None], Callable[[re.Match[str]], None]]
 
-
 @dataclass
 class Trigger:
     pattern: re.Pattern[str]
     action: TriggerAction
     once: bool
     use_match: bool
+
 OutputHandler = Callable[[str, Optional[str]], None]
 
 
@@ -348,7 +348,7 @@ class OllamaCommandController:
                 headers={'Content-Type': 'application/json'},
                 timeout=urllib3.Timeout(connect=2.0, read=20.0),
             )
-        except Exception as exc:  # pragma: no cover - network failure logging
+        except Exception as exc:  # pragma: no cover
             print(f"[ollama] request failed: {exc}", file=sys.stderr)
             return ""
 
@@ -386,6 +386,7 @@ class OllamaCommandController:
         if commands:
             return commands[:3]
 
+        # Fallback: grab first 3 non-empty lines as commands
         for line in stripped.splitlines():
             cleaned = line.strip().strip('#').strip()
             if not cleaned:
@@ -394,6 +395,7 @@ class OllamaCommandController:
             if len(commands) >= 3:
                 break
         return commands
+
 
 class T2TMUDClient:
     def __init__(self, h, p, *, on_disconnect: Optional[Callable[[bool], None]] = None):
@@ -585,6 +587,7 @@ class T2TMUDClient:
                 self.send(command)
             time.sleep(self.automation_delay)
 
+
 def print_out(text, _):
     cleaned = text.replace('\r\n', '\n').replace('\r', '\n')
     print(cleaned, end='')
@@ -597,6 +600,7 @@ def configure_client(
 ):
     client.profile = profile
     automation_commands = profile.automation_commands or DEFAULT_AUTOMATION_COMMANDS
+    # If using Ollama to drive commands, keep automation loop alive but empty commands (controller queues its own)
     if ollama_controller and ollama_controller.enabled:
         automation_commands = ("",)
     client.set_automation(automation_commands, AUTOMATION_DELAY_SECONDS)
@@ -691,7 +695,7 @@ def configure_client(
             self.last_sign_seen = now
             client.queue_script(["read sign"])
 
-        def inspect_map(self, _match: Optional[re.Match[str]] = None):
+        def inspect_map(self, _match: Optional[re_match] := None):
             now = time.monotonic()
             if now - self.last_map_check < 30.0:
                 return
@@ -1363,6 +1367,7 @@ def main():
         print("Disconnected.")
     else:
         print("Disconnected.")
+
 
 if __name__ == '__main__':
     main()
