@@ -49,6 +49,7 @@ PROMPT_STATUS_PATTERN = re.compile(r"HP:\s*(?P<hp>\d+)\s+EP:\s*(?P<ep>\d+)>")
 HINT_PATTERN = re.compile(r"^\*\*\* HINT \*\*\*")
 HELP_HEADER_PATTERN = re.compile(r"^Help for ")
 MORE_PATTERN = re.compile(r"--More--")
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-9;?]*[A-Za-z]")
 TRAVELTO_START_PATTERN = re.compile(r"Travelto:\s+Journey begun", re.IGNORECASE)
 TRAVELTO_ABORT_PATTERN = re.compile(r"Travelto:\s+aborted", re.IGNORECASE)
 TRAVELTO_RESUME_PATTERN = re.compile(r"Travelto:\s+resuming journey", re.IGNORECASE)
@@ -109,6 +110,32 @@ CONSIDER_PATTERN = re.compile(
     r"(?P<target>[A-Z][\w' -]+) is (?P<assessment>[^.]+)\.",
     re.IGNORECASE,
 )
+
+CONSIDER_TARGET_STOPWORDS = {
+    "this",
+    "there",
+    "the",
+    "it",
+    "you",
+    "news",
+    "mortal",
+    "updates",
+}
+
+CONSIDER_ASSESSMENT_KEYWORDS = {
+    "killable",
+    "match",
+    "challenge",
+    "danger",
+    "dangerous",
+    "tough",
+    "weak",
+    "easy",
+    "threat",
+    "pushover",
+    "deadly",
+    "overmatched",
+}
 SUGGEST_ACTION_PATTERN = re.compile(r"Perhaps it could be (?P<action>[a-z]+)", re.IGNORECASE)
 MAP_SUGGESTION_PATTERN = re.compile(r"use the 'map' command", re.IGNORECASE)
 HINT_SUGGESTION_PATTERN = re.compile(r"\*\*\* HINT \*\*\*\s*:\s*(?P<hint>.+)")
@@ -718,157 +745,6 @@ def _extract_json_fragment(text: str) -> Optional[str]:
                 return text[start : index + 1]
     return None
 
-    PROGRESSION_CHECKS: Sequence[str] = (
-        "score",
-        "quests",
-        "mission",
-        "legendinfo",
-        "charinfo",
-        "skills",
-        "train",
-        "practice",
-        "guilds",
-        "journal",
-        "notes",
-        "killboard",
-        "achievements",
-    )
-
-    PREPARATION_TIPS: Sequence[str] = (
-        "Eat or drink in inns to recover faster before long hunts.",
-        "Carry spare weapons and armor and equip upgrades immediately.",
-        "Check message boards and news for job leads or bounties.",
-        "Bank excess gold to avoid losing coins on death.",
-        "Rent rooms when you have spare gold to unlock private rest areas.",
-        "Stock up on food, drink, and torches before long expeditions.",
-        "Keep rope, lockpicks, and light sources for dungeons and caves.",
-        "Purchase bags or packs to increase carrying capacity before looting sprees.",
-        "Carry healing draughts or bandages if you plan to tackle tougher foes.",
-        "Study help files for each profession to unlock unique abilities.",
-        "Maintain a list of profitable hunting spots and rotate between them.",
-        "Store quest-critical items safely in the bank until needed.",
-    )
-
-    SAFETY_REMINDERS: Sequence[str] = (
-        "Check HP and EP before every combat engagement.",
-        "Abort travelto if HP drops dangerously low during the journey.",
-        "Carry a light source in dark zones to avoid stumbling into hazards.",
-        "Avoid stealing from NPCs to prevent guard retaliation.",
-        "Retreat from creatures that your attacks cannot harm.",
-        "Rest after long hunts so energy regenerates before the next fight.",
-        "Deposit gold frequently to safeguard progress after successful hunts.",
-        "Keep antidotes or cure poison potions for swamp regions.",
-        "Use 'consider <target>' before starting fights with unknown foes.",
-        "Head back to town when stamina or supplies run low.",
-    )
-
-    STRATEGY_GUIDELINES: Sequence[str] = (
-        "Always inspect rooms with 'look' and note available exits.",
-        "Use 'hint' whenever progress seems unclear or a help prompt appears.",
-        "Read message boards, signs, and help topics to gather objectives.",
-        "Interact with NPCs using 'say' and 'ask <npc> about <topic>'.",
-        "Follow signposts with 'travelto <destination>' and let the journey finish before issuing other commands; resume with 'travelto resume' if paused.",
-        "Seek supplies in taverns: 'order <item>', 'rent room', and 'rest' recover resources faster when others are nearby.",
-        "If gold is low, explore nearby streets, wilderness, or hunting grounds, search containers, loot corpses with 'get coins' or 'get all corpse', and sell excess gear before attempting large purchases.",
-        "Before engaging, 'consider <target>' to judge difficulty, focus on low-level creatures or obvious foes, and be ready to 'flee' if health drops.",
-        "After combat, loot coins and valuables, then visit shops or innkeepers to 'list', 'value', 'sell', or 'buy' needed items.",
-        "Follow rumours, message boards, and NPC dialogue for hints about hunting grounds or profitable activities.",
-        "When a shopkeeper or quest giver refuses to help, try other NPCs, different topics such as 'work', 'rumours', 'jobs', or explore outside to find creatures to hunt.",
-        "If movement is blocked, pick another exit or resume 'travelto' journeys from the last signpost.",
-        "Restock resources by resting, eating, or renting rooms when coins allow; gather more money before renting if refused.",
-        "When help topics suggest more reading, queue follow-up 'help <topic>' calls.",
-        "When '--More--' pagination appears, send a blank command to continue.",
-        "Avoid repeating the same command rapidly if the game says you cannot do it.",
-        "Only send in-game commands; never respond with narrative text.",
-        "Record gold income and expenses; if funds drop to zero, hunt or sell items before attempting purchases.",
-        "When NPCs refuse to help, leave the building and explore nearby paths for alternate opportunities.",
-        "Follow time-of-day or weather cues to decide when to rest, travel, or hunt.",
-        "Check 'quests' or 'mission' regularly to track objectives after completing tasks.",
-        "Return to towns to resupply when inventory is empty or equipment is damaged.",
-        "Use 'travelto' to reach fresh hunting grounds when current areas are exhausted.",
-        "Loot corpses promptly to secure coins before they vanish.",
-        "Visit banks to deposit earnings once you have more than a handful of coins.",
-        "If rest is interrupted, find safer rooms or finish combat encounters before trying again.",
-        "Read stable and travel signs to learn additional transportation commands.",
-        "Use 'map' in wilderness areas to orient yourself toward nearby towns or paths.",
-        "Lift, push, or pull suspicious objects when descriptions hint at hidden caches.",
-        "Rotate through multiple exits if searches keep failing to avoid wasting energy.",
-        "Prioritize foes that drop coins or sellable loot before attempting costly purchases.",
-        "When damage is ineffective, retreat, re-equip stronger weapons, or target a weaker enemy.",
-        "Keep track of encumbrance; deposit or sell items before it becomes burdensome.",
-        "If automation stalls in one room, choose a new exit or resume 'travelto' to reach another hub.",
-        "Look for interactive verbs like lift, press, or open in room descriptions and try them explicitly.",
-        "Read forge or workshop signs for crafting opportunities and order materials before experimenting.",
-        "When hints reference specific NPCs, go find them immediately before forgetting their names.",
-        "Rest to recover energy before re-engaging in extended hunts or travelto journeys.",
-        "Record helpful help topics and revisit them if similar issues arise later.",
-        "Check 'legendinfo' and 'charinfo' for long-term goals or progress markers.",
-    )
-
-    @classmethod
-    def build_reference(cls) -> str:
-        def fmt_section(title: str, entries: Iterable[str]) -> str:
-            return f"{title}: " + ", ".join(entries)
-
-        sections = [
-            fmt_section("Core exploration", cls.CORE_COMMANDS),
-            fmt_section("Travel", cls.TRAVEL_COMMANDS),
-            fmt_section("Movement", cls.MOVEMENT_COMMANDS),
-            fmt_section("Interaction", cls.INTERACTION_COMMANDS),
-            fmt_section("Utility", cls.UTILITY_COMMANDS),
-            fmt_section("Economy", cls.ECONOMY_COMMANDS),
-            fmt_section("Town services", cls.TOWN_SERVICES),
-            fmt_section("Support", cls.SUPPORT_COMMANDS),
-            fmt_section("Social", cls.SOCIAL_COMMANDS),
-            fmt_section("Combat", cls.COMBAT_COMMANDS),
-            fmt_section("Hunting", cls.HUNTING_COMMANDS),
-            fmt_section("Wilderness", cls.WILDERNESS_COMMANDS),
-            fmt_section("Crafting", cls.CRAFTING_COMMANDS),
-            fmt_section("Quests", cls.QUEST_COMMANDS),
-            fmt_section("Progress tracking", cls.PROGRESSION_CHECKS),
-            "Preparation: " + ", ".join(cls.PREPARATION_TIPS),
-            "Safety: " + ", ".join(cls.SAFETY_REMINDERS),
-            "Guidelines: " + " ".join(cls.STRATEGY_GUIDELINES),
-        ]
-        return "\n".join(sections)
-
-
-###############################################################################
-# Ollama integration
-###############################################################################
-
-
-def _extract_json_fragment(text: str) -> Optional[str]:
-    depth = 0
-    start = None
-    in_string = False
-    escape = False
-    for index, char in enumerate(text):
-        if in_string:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            if depth == 0:
-                start = index
-            depth += 1
-        elif char == "}":
-            if depth == 0:
-                continue
-            depth -= 1
-            if depth == 0 and start is not None:
-                return text[start : index + 1]
-    return None
-
-
-class OllamaPlanner:
-    """Collect transcript context and ask Ollama for next commands."""
 
 class OllamaPlanner:
     """Collect transcript context and ask Ollama for next commands."""
@@ -1343,6 +1219,11 @@ class OllamaPlanner:
                 continue
             if stripped.startswith('"') and stripped.endswith('"'):
                 continue
+            lowered = stripped.lower()
+            if any(ch in stripped for ch in "{}[]\""):
+                continue
+            if "commands" in lowered or "comment" in lowered:
+                continue
             commands.append(stripped)
             if len(commands) >= self.max_commands:
                 break
@@ -1520,10 +1401,11 @@ class TelnetSession:
                 time.sleep(0.05)
                 continue
             text = raw.decode("ascii", errors="ignore")
+            clean_text = ANSI_ESCAPE_RE.sub("", text)
             self.display.feed(text)
             if self._planner:
                 self._planner.observe_output(text)
-            self._buffer += text
+            self._buffer += clean_text
             if len(self._buffer) > 8192:
                 self._buffer = self._buffer[-4096:]
             self._process_buffer()
@@ -1579,6 +1461,7 @@ class TelnetSession:
                 self._planner.note_event("Travelto auto-travel engaged")
                 self._planner.update_travel_state("auto-travel engaged")
             self._consume(TRAVELTO_START_PATTERN)
+            self._handle_prompt()
             return
         if TRAVELTO_RESUME_PATTERN.search(self._buffer):
             self._travel_active = True
@@ -1587,6 +1470,7 @@ class TelnetSession:
                 self._planner.note_event("Travelto route resumed")
                 self._planner.update_travel_state("auto-travel resumed")
             self._consume(TRAVELTO_RESUME_PATTERN)
+            self._handle_prompt()
             return
         if TRAVELTO_ABORT_PATTERN.search(self._buffer) or TRAVELTO_COMPLETE_PATTERN.search(self._buffer):
             self._travel_active = False
@@ -1597,6 +1481,7 @@ class TelnetSession:
                 self._planner.request_commands("travelto ended")
             self._buffer = TRAVELTO_ABORT_PATTERN.sub("", self._buffer)
             self._buffer = TRAVELTO_COMPLETE_PATTERN.sub("", self._buffer)
+            self._handle_prompt()
             return
         location_name: Optional[str] = None
         location_match = LOCATION_AT_PATTERN.search(self._buffer)
@@ -1743,6 +1628,7 @@ class TelnetSession:
                 self._planner.record_opportunity("Recent victory yielded experience; consider pressing the advantage")
                 self._planner.request_commands("experience gained")
             self._remove_match(xp_match)
+            self._handle_prompt()
             return
         level_match = LEVEL_UP_PATTERN.search(self._buffer)
         if level_match:
@@ -1754,6 +1640,7 @@ class TelnetSession:
                 self._planner.record_opportunity("Level increased; visit trainers or spend new skill points")
                 self._planner.request_commands("level up")
             self._remove_match(level_match)
+            self._handle_prompt()
             return
         skill_match = SKILL_IMPROVE_PATTERN.search(self._buffer)
         if skill_match:
@@ -1765,6 +1652,7 @@ class TelnetSession:
                 self._planner.record_opportunity(f"Skill {skill} improved; seek tougher challenges")
                 self._planner.request_commands("skill improved")
             self._remove_match(skill_match)
+            self._handle_prompt()
             return
         coin_match = COIN_GAIN_PATTERN.search(self._buffer)
         if coin_match:
@@ -1777,6 +1665,7 @@ class TelnetSession:
                 self._planner.record_opportunity("Gold reserves growing; consider visiting shops or banks")
                 self._planner.request_commands("gold collected")
             self._remove_match(coin_match)
+            self._handle_prompt()
             return
         item_match = ITEM_ACQUIRE_PATTERN.search(self._buffer)
         if item_match:
@@ -1789,6 +1678,7 @@ class TelnetSession:
                     self._planner.record_opportunity(f"Evaluate newly acquired {item} for use or sale")
                     self._planner.request_commands("item acquired")
             self._remove_match(item_match)
+            self._handle_prompt()
             return
         search_success_match = SEARCH_SUCCESS_PATTERN.search(self._buffer)
         if search_success_match:
@@ -1801,6 +1691,7 @@ class TelnetSession:
                 self._planner.record_opportunity(f"Investigate discovered {discovery}")
                 self._planner.request_commands("search success")
             self._remove_match(search_success_match)
+            self._handle_prompt()
             return
         rest_complete_match = REST_COMPLETE_PATTERN.search(self._buffer)
         if rest_complete_match:
@@ -1811,6 +1702,7 @@ class TelnetSession:
                 self._planner.record_opportunity("Recovered energy; resume exploration or hunting")
                 self._planner.request_commands("rest complete")
             self._remove_match(rest_complete_match)
+            self._handle_prompt()
             return
         door_open_match = DOOR_OPENED_PATTERN.search(self._buffer)
         if door_open_match:
@@ -1820,6 +1712,7 @@ class TelnetSession:
                 self._planner.note_event(f"Opened {direction} door")
                 self._planner.request_commands("door opened")
             self._remove_match(door_open_match)
+            self._handle_prompt()
             return
         door_locked_match = DOOR_LOCKED_PATTERN.search(self._buffer)
         if door_locked_match:
@@ -1829,6 +1722,7 @@ class TelnetSession:
                 self._planner.record_issue(f"{direction.title()} door locked")
                 self._planner.request_commands("door locked")
             self._remove_match(door_locked_match)
+            self._handle_prompt()
             return
         hint_match = HINT_SUGGESTION_PATTERN.search(self._buffer)
         if hint_match:
@@ -1894,6 +1788,7 @@ class TelnetSession:
                 if self._planner:
                     self._planner.note_event("Repeated purchase failures due to zero gold")
             self._remove_match(match)
+            self._handle_prompt()
             return
         match = RENT_ROOM_REQUIRED_PATTERN.search(self._buffer)
         if match:
@@ -1902,6 +1797,7 @@ class TelnetSession:
                 self._planner.note_event("Need to rent a room before entering private quarters")
                 self._planner.request_commands("rent room required")
             self._remove_match(match)
+            self._handle_prompt()
             return
         match = TRAVELTO_SIGNPOST_PATTERN.search(self._buffer)
         if match:
@@ -1910,6 +1806,7 @@ class TelnetSession:
                 self._planner.note_event("Travelto attempt failed away from signpost")
                 self._planner.request_commands("travelto signpost needed")
             self._remove_match(match)
+            self._handle_prompt()
             return
         menu_match = MENU_HINT_PATTERN.search(self._buffer)
         if menu_match:
@@ -1941,6 +1838,7 @@ class TelnetSession:
                 if self._planner:
                     self._planner.note_event("Repeated search failures")
             self._remove_match(match)
+            self._handle_prompt()
             return
         match = DIRECTION_BLOCK_PATTERN.search(self._buffer)
         if match:
@@ -1949,6 +1847,7 @@ class TelnetSession:
                 self._planner.note_event("Path blocked by obstacle")
                 self._planner.request_commands("movement blocked")
             self._remove_match(match)
+            self._handle_prompt()
             return
         door_match = CLOSED_DOOR_PATTERN.search(self._buffer)
         if door_match:
@@ -1961,6 +1860,7 @@ class TelnetSession:
                 self._planner.record_issue(f"{direction} door closed")
                 self._planner.request_commands("door closed")
             self._remove_match(door_match)
+            self._handle_prompt()
             return
         match = TARGET_MISSING_PATTERN.search(self._buffer)
         if match:
@@ -1969,6 +1869,7 @@ class TelnetSession:
                 self._planner.note_event("Attempted interaction failed; target missing")
                 self._planner.request_commands("target missing")
             self._remove_match(match)
+            self._handle_prompt()
             return
         match = TAKE_MISSING_PATTERN.search(self._buffer)
         if match:
@@ -1977,6 +1878,7 @@ class TelnetSession:
                 self._planner.note_event("Failed to pick up item")
                 self._planner.request_commands("item missing")
             self._remove_match(match)
+            self._handle_prompt()
             return
         corpse_match = CORPSE_MISSING_PATTERN.search(self._buffer)
         if corpse_match:
@@ -1985,6 +1887,7 @@ class TelnetSession:
                 self._planner.record_issue("Attempted to loot before corpse existed")
                 self._planner.request_commands("corpse missing")
             self._remove_match(corpse_match)
+            self._handle_prompt()
             return
         stock_match = NO_STOCK_PATTERN.search(self._buffer)
         if stock_match:
@@ -1994,6 +1897,7 @@ class TelnetSession:
                 self._planner.record_issue("Requested item not sold here")
                 self._planner.request_commands("item unavailable")
             self._remove_match(stock_match)
+            self._handle_prompt()
             return
         belongs_match = ITEM_BELONGS_PATTERN.search(self._buffer)
         if belongs_match:
@@ -2002,6 +1906,7 @@ class TelnetSession:
                 self._planner.record_issue("Item was owned; look for alternatives")
                 self._planner.request_commands("item owned")
             self._remove_match(belongs_match)
+            self._handle_prompt()
             return
         match = STEALING_PATTERN.search(self._buffer)
         if match:
@@ -2010,6 +1915,7 @@ class TelnetSession:
                 self._planner.note_event("Stealing attempt blocked")
                 self._planner.request_commands("stealing blocked")
             self._remove_match(match)
+            self._handle_prompt()
             return
         match = MULTI_TARGET_PATTERN.search(self._buffer)
         if match:
@@ -2018,6 +1924,7 @@ class TelnetSession:
                 self._planner.note_event("Need to disambiguate multi-target selection")
                 self._planner.request_commands("multiple targets")
             self._remove_match(match)
+            self._handle_prompt()
             return
         wield_match = WIELD_WHAT_PATTERN.search(self._buffer)
         if wield_match:
@@ -2026,6 +1933,7 @@ class TelnetSession:
                 self._planner.record_issue("Wield command missing target item")
                 self._planner.request_commands("wield guidance")
             self._remove_match(wield_match)
+            self._handle_prompt()
             return
         news_match = NEWS_ALERT_PATTERN.search(self._buffer)
         if news_match:
@@ -2046,6 +1954,7 @@ class TelnetSession:
                 self._planner.record_issue(f"{npc} could not help")
                 self._planner.request_commands("npc unhelpful")
             self._remove_match(match)
+            self._handle_prompt()
             return
         blank_match = BLANK_RESPONSE_PATTERN.search(self._buffer)
         if blank_match:
@@ -2057,6 +1966,7 @@ class TelnetSession:
                 if self._blank_response_streak >= 2:
                     self._planner.request_commands("npc unresponsive")
             self._remove_match(blank_match)
+            self._handle_prompt()
             return
         match = REST_START_PATTERN.search(self._buffer)
         if match:
@@ -2066,6 +1976,7 @@ class TelnetSession:
                 self._planner.update_rest_state("resting")
                 self._planner.request_commands("resting")
             self._remove_match(match)
+            self._handle_prompt()
             return
         match = REST_INTERRUPT_PATTERN.search(self._buffer)
         if match:
@@ -2075,6 +1986,7 @@ class TelnetSession:
                 self._planner.update_rest_state("interrupted")
                 self._planner.request_commands("rest interrupted")
             self._remove_match(match)
+            self._handle_prompt()
             return
         busy_match = BUSY_ATTACK_PATTERN.search(self._buffer)
         if busy_match:
@@ -2082,6 +1994,7 @@ class TelnetSession:
             if self._planner:
                 self._planner.record_issue("Too busy to attack; avoid spamming commands")
             self._remove_match(busy_match)
+            self._handle_prompt()
             return
         no_effect_match = NO_EFFECT_PATTERN.search(self._buffer)
         if no_effect_match:
@@ -2090,6 +2003,7 @@ class TelnetSession:
                 self._planner.record_issue("Attacks ineffective against foe")
                 self._planner.request_commands("attack ineffective")
             self._remove_match(no_effect_match)
+            self._handle_prompt()
             return
         low_damage_match = LOW_DAMAGE_PATTERN.search(self._buffer)
         if low_damage_match:
@@ -2101,13 +2015,20 @@ class TelnetSession:
         if consider_match:
             target = consider_match.group("target").strip()
             assessment = consider_match.group("assessment").strip()
-            self.display.emit(
-                "event",
-                f"Assessment: {target} is {assessment}; choose fights accordingly",
-            )
-            if self._planner:
-                self._planner.note_event(f"Considered {target}: {assessment}")
-            self._remove_match(consider_match)
+            target_head = target.lower().split()[0]
+            assessment_lower = assessment.lower()
+            if target_head in CONSIDER_TARGET_STOPWORDS or not any(
+                keyword in assessment_lower for keyword in CONSIDER_ASSESSMENT_KEYWORDS
+            ):
+                self._remove_match(consider_match)
+            else:
+                self.display.emit(
+                    "event",
+                    f"Assessment: {target} is {assessment}; choose fights accordingly",
+                )
+                if self._planner:
+                    self._planner.note_event(f"Considered {target}: {assessment}")
+                self._remove_match(consider_match)
         enemy_match = TARGET_LINE_PATTERN.search(self._buffer)
         if enemy_match:
             raw_name = enemy_match.group("name").strip()
@@ -2122,6 +2043,7 @@ class TelnetSession:
                     self._planner.note_event(message)
                     self._planner.request_commands("enemy spotted")
             self._remove_match(enemy_match)
+            self._handle_prompt()
             return
         quests_match = NO_QUESTS_PATTERN.search(self._buffer)
         if quests_match:
@@ -2131,6 +2053,7 @@ class TelnetSession:
                 self._planner.record_issue("Seek quests or newbie jobs")
                 self._planner.request_commands("quest search")
             self._remove_match(quests_match)
+            self._handle_prompt()
             return
         gold_matches = list(GOLD_STATUS_PATTERN.finditer(self._buffer))
         if gold_matches:
@@ -2153,23 +2076,9 @@ class TelnetSession:
             if amount > 0:
                 self._gold_failures = 0
             self._remove_match(last_match)
+            self._handle_prompt()
             return
-        if PROMPT_PATTERN.search(self._buffer):
-            if self._travel_active:
-                self._consume(PROMPT_PATTERN)
-                return
-            if not self._logged_in:
-                self._logged_in = True
-                self.display.emit("event", "Login successful; interactive prompt ready")
-                if self._planner:
-                    self._planner.activate()
-                    self._planner.note_event("Reached status prompt")
-            else:
-                if self._planner:
-                    self._planner.note_event("Status prompt available")
-            if self._planner:
-                self._planner.request_commands("prompt")
-            self._consume(PROMPT_PATTERN)
+        if self._handle_prompt():
             return
         if MORE_PATTERN.search(self._buffer) or PRESS_ENTER_PATTERN.search(self._buffer):
             self.display.emit("event", "Pagination prompt detected; sending newline")
@@ -2177,6 +2086,27 @@ class TelnetSession:
             if self._planner:
                 self._planner.request_commands("pagination")
             self._buffer = ""
+
+    def _handle_prompt(self) -> bool:
+        prompt_match = PROMPT_PATTERN.search(self._buffer)
+        if not prompt_match:
+            return False
+        if self._travel_active:
+            self._consume(PROMPT_PATTERN)
+            return True
+        if not self._logged_in:
+            self._logged_in = True
+            self.display.emit("event", "Login successful; interactive prompt ready")
+            if self._planner:
+                self._planner.activate()
+                self._planner.note_event("Reached status prompt")
+        else:
+            if self._planner:
+                self._planner.note_event("Status prompt available")
+        if self._planner:
+            self._planner.request_commands("prompt")
+        self._consume(PROMPT_PATTERN)
+        return True
 
     def _consume(self, pattern: re.Pattern[str]):
         match = pattern.search(self._buffer)
